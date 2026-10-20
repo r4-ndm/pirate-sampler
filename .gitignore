@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.wav
+!testdata/**/*.wav
+.idea/
+.vscode/
+
+# local build artifacts and backups
+target/
+.backup-*/
+tmux-*.log
+vendor/nih-plug/.git/

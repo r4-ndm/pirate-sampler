@@ -1,0 +1,18 @@
+[package]
+name = "pirate-sampler-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Framework-free DSP for Pirate Sampler (ring buffer, WAV export)"
+
+[dependencies]
+hound.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+hound.workspace = true
+tempfile = "3"

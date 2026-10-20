@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pirate-sampler-dsp",
+    "crates/pirate-sampler",
+    "xtask",
+]
+default-members = ["crates/pirate-sampler", "crates/pirate-sampler-dsp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Pirate Sampler contributors"]
+repository = "https://github.com/local/pirate-sampler"
+
+[workspace.dependencies]
+pirate-sampler-dsp = { path = "crates/pirate-sampler-dsp" }
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs", "standalone"] }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+parking_lot = "0.12"
+rfd = "0.15"
+atomic_float = "1.1"
+
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "vendor/nih-plug" }
+nih_plug_egui = { path = "vendor/nih-plug/nih_plug_egui" }
+nih_plug_xtask = { path = "vendor/nih-plug/nih_plug_xtask" }

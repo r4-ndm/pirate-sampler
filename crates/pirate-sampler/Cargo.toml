@@ -1,0 +1,32 @@
+[package]
+name = "pirate-sampler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pirate Sampler — rolling ring-buffer capture plugin (VST3 + standalone)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pirate-sampler"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["standalone"]
+standalone = ["nih_plug/standalone"]
+
+[dependencies]
+pirate-sampler-dsp.workspace = true
+nih_plug.workspace = true
+nih_plug_egui.workspace = true
+parking_lot.workspace = true
+rfd.workspace = true
+atomic_float.workspace = true
+hound.workspace = true
+
+# Frameless window chrome (undecorate / minimize / drag-to-move) for the
+# standalone build. Already in the dependency graph via baseview.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
