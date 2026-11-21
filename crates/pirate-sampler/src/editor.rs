@@ -432,6 +432,14 @@ fn draw_side_panel(
     if ui.available_height() >= H_SOURCE_TOGGLE && !compact {
         draw_stacked_source_toggle(ui, ed, full_w);
     } else if ui.available_height() >= 20.0 {
+        if !has_top_brand {
+            // Center the single control row vertically in the available panel space
+            let seg_h = 24.0_f32.min(ui.available_height());
+            let rem_h = (ui.available_height() - seg_h).max(0.0);
+            if rem_h > 1.0 {
+                ui.add_space((rem_h * 0.5).floor());
+            }
+        }
         draw_side_by_side_source_toggle(ui, ed, full_w, !has_top_brand);
     }
 
