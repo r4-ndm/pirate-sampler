@@ -102,14 +102,52 @@ impl RingBuffer {
     }
 
     /// Change active duration without reallocating when storage is large enough.
-    /// Clears the buffer. RT-safe if the new capacity fits in `storage`.
+    ///
+    /// Preserves existing audio without heap allocations:
+    /// - If the buffer expands, existing audio is kept intact.
+    /// - If the buffer shrinks below current filled frames, only the oldest audio
+    ///   is dropped, keeping the most recent `new_capacity` frames.
+    ///
+    /// RT-safe if the new capacity fits in `storage`.
     pub fn set_duration_rt_safe(&mut self, duration: BufferDuration) -> bool {
         let needed = buffer_capacity_frames(self.sample_rate, duration);
         if needed > self.storage {
             return false;
         }
-        self.capacity = needed.max(1);
-        self.clear();
+        let new_cap = needed.max(1);
+        if new_cap == self.capacity {
+            return true;
+        }
+
+        // Linearize active filled slice so index 0 is oldest and filled-1 is newest
+        if self.filled == self.capacity && self.write_pos > 0 && self.write_pos < self.capacity {
+            self.left[..self.capacity].rotate_left(self.write_pos);
+            self.right[..self.capacity].rotate_left(self.write_pos);
+            self.write_pos = 0;
+        }
+
+        if new_cap < self.filled {
+            // Buffer shrunk: drop oldest excess frames, keeping the most recent new_cap frames
+            let excess = self.filled - new_cap;
+            self.left.copy_within(excess..self.filled, 0);
+            self.right.copy_within(excess..self.filled, 0);
+            self.filled = new_cap;
+            self.write_pos = 0;
+        } else {
+            // Buffer expanded: keep existing audio, write_pos continues at filled
+            self.write_pos = if self.filled == new_cap {
+                0
+            } else {
+                self.filled
+            };
+            // Zero out unused area in new capacity
+            for i in self.filled..new_cap {
+                self.left[i] = 0.0;
+                self.right[i] = 0.0;
+            }
+        }
+
+        self.capacity = new_cap;
         true
     }
 
@@ -298,5 +336,43 @@ mod tests {
         let mut rb = RingBuffer::with_capacity(48_000.0, 2);
         rb.write_frame(f32::NAN, f32::INFINITY);
         assert_eq!(rb.read_logical(0), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn set_duration_preserves_audio_when_expanding_and_shrinking() {
+        // Storage for 60 seconds at 100 Hz = 6000 frames
+        let sr = 100.0;
+        let mut rb = RingBuffer::with_max_duration(sr, BufferDuration::new(30.0));
+        let cap_30 = rb.capacity_frames(); // 3000 frames
+
+        // Write 3500 frames (so buffer wraps around!)
+        for i in 0..3500 {
+            rb.write_frame(i as f32, -(i as f32));
+        }
+        // Buffer was full: logical 0 is 500, logical 2999 is 3499
+        assert_eq!(rb.filled_frames(), cap_30);
+        assert_eq!(rb.read_logical(0), Some((500.0, -500.0)));
+        assert_eq!(rb.read_logical(cap_30 - 1), Some((3499.0, -3499.0)));
+
+        // Expand duration to 45 seconds (4500 frames): existing 3000 frames must be preserved
+        assert!(rb.set_duration_rt_safe(BufferDuration::new(45.0)));
+        assert_eq!(rb.capacity_frames(), 4500);
+        assert_eq!(rb.filled_frames(), 3000);
+        assert_eq!(rb.read_logical(0), Some((500.0, -500.0)));
+        assert_eq!(rb.read_logical(2999), Some((3499.0, -3499.0)));
+
+        // Write 500 more frames
+        for i in 3500..4000 {
+            rb.write_frame(i as f32, -(i as f32));
+        }
+        assert_eq!(rb.filled_frames(), 3500);
+        assert_eq!(rb.read_logical(3499), Some((3999.0, -3999.0)));
+
+        // Shrink duration to 30 seconds (3000 frames): keeps the 3000 most recent frames [1000..3999]
+        assert!(rb.set_duration_rt_safe(BufferDuration::new(30.0)));
+        assert_eq!(rb.capacity_frames(), 3000);
+        assert_eq!(rb.filled_frames(), 3000);
+        assert_eq!(rb.read_logical(0), Some((1000.0, -1000.0)));
+        assert_eq!(rb.read_logical(2999), Some((3999.0, -3999.0)));
     }
 }
