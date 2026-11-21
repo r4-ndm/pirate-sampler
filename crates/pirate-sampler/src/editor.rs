@@ -679,20 +679,20 @@ fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect
     // Cached raw RGBA texture loaded from the pre-rasterized M & crossbones SVG
     const RAW_LOGO_RGBA: &[u8] = include_bytes!("m-and-bones-128.rgba");
     let tex_id = egui::Id::new("pirate_sampler_m_bones_logo_tex");
-    let texture = ui.ctx().data_mut(|d| {
-        if let Some(handle) = d.get_temp::<egui::TextureHandle>(tex_id) {
-            handle
-        } else {
+    let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(tex_id));
+    let texture = match cached {
+        Some(handle) => handle,
+        None => {
             let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], RAW_LOGO_RGBA);
             let handle = ui.ctx().load_texture(
                 "pirate_sampler_m_bones_logo",
                 image,
                 egui::TextureOptions::LINEAR,
             );
-            d.insert_temp(tex_id, handle.clone());
+            ui.ctx().data_mut(|d| d.insert_temp(tex_id, handle.clone()));
             handle
         }
-    });
+    };
 
     // Inset slightly inside the card badge for clean margins
     let inner_rect = badge_rect.shrink(1.5);
