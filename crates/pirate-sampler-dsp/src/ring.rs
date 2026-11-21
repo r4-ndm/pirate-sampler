@@ -259,13 +259,33 @@ impl RingBuffer {
 
     /// Downsample peaks for UI: returns max abs per bucket for L/R as `(l, r)`.
     pub fn waveform_peaks(&self, buckets: usize) -> Vec<(f32, f32)> {
+        self.waveform_peaks_range(buckets, 0.0, 1.0)
+    }
+
+    /// Downsample peaks for UI within a normalized view range `(view_start..=view_end)`.
+    pub fn waveform_peaks_range(
+        &self,
+        buckets: usize,
+        view_start: f32,
+        view_end: f32,
+    ) -> Vec<(f32, f32)> {
         if buckets == 0 || self.filled == 0 {
             return Vec::new();
         }
+        let v_start = view_start.clamp(0.0, 1.0).min(view_end);
+        let v_end = view_end.clamp(0.0, 1.0).max(v_start);
+
+        let total_filled = self.filled as f32;
+        let start_frame = (v_start * total_filled).floor() as usize;
+        let end_frame = ((v_end * total_filled).ceil() as usize)
+            .min(self.filled)
+            .max(start_frame + 1);
+        let span = end_frame.saturating_sub(start_frame).max(1);
+
         let mut peaks = Vec::with_capacity(buckets);
         for b in 0..buckets {
-            let start = b * self.filled / buckets;
-            let end = ((b + 1) * self.filled / buckets).max(start + 1);
+            let start = start_frame + b * span / buckets;
+            let end = (start_frame + (b + 1) * span / buckets).max(start + 1);
             let mut max_l = 0.0f32;
             let mut max_r = 0.0f32;
             for logical in start..end.min(self.filled) {

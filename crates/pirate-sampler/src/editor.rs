@@ -59,6 +59,13 @@ pub struct EditorState {
     /// Selection as normalized 0..1 over the filled buffer (start, end).
     pub selection: Option<(f32, f32)>,
     pub drag_anchor: Option<f32>,
+    /// A left press landed inside the selection: a drag from there drags the clip out.
+    pub selection_body_press: bool,
+    /// Waveform view range in normalized buffer coordinates; may extend beyond 0.0..=1.0.
+    pub view_range: (f32, f32),
+    pub is_panning: bool,
+    pub pan_start_pos: Option<f32>,
+    pub pan_start_range: (f32, f32),
     pub status: String,
     pub freeze_view: bool,
     pub frozen_peaks: Option<Vec<(f32, f32)>>,
@@ -73,6 +80,11 @@ impl EditorState {
             ring,
             selection: None,
             drag_anchor: None,
+            selection_body_press: false,
+            view_range: (0.0, 1.0),
+            is_panning: false,
+            pan_start_pos: None,
+            pan_start_range: (0.0, 1.0),
             status: "Ready - System Audio".to_string(),
             freeze_view: false,
             frozen_peaks: None,

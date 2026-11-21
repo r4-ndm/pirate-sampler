@@ -9,6 +9,18 @@ use crate::theme;
 
 const EDGE_GRAB_PX: f32 = 8.0;
 
+/// Pixel x for a normalized buffer position inside the visible `view` window.
+fn x_at_t(t: f32, plot_rect: egui::Rect, view: (f32, f32)) -> f32 {
+    let span = (view.1 - view.0).max(f32::EPSILON);
+    plot_rect.left() + ((t - view.0) / span) * plot_rect.width()
+}
+
+/// Normalized buffer position for a pixel x inside the visible `view` window.
+fn t_at_x(x: f32, plot_rect: egui::Rect, view: (f32, f32)) -> f32 {
+    let span = (view.1 - view.0).max(f32::EPSILON);
+    view.0 + ((x - plot_rect.left()) / plot_rect.width()) * span
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_waveform_card(
     ui: &mut egui::Ui,
@@ -40,10 +52,11 @@ pub fn draw_waveform_card(
             mid,
             a,
             b,
-            hovering_edge || response.dragged(),
+            hovering_edge,
             filled_frames,
             cap_secs,
             sr,
+            ed.view_range,
         );
     }
 
@@ -61,6 +74,11 @@ fn draw_peaks(
     is_empty: bool,
 ) {
     let num_buckets = (plot_rect.width().max(32.0) as usize).clamp(32, 2048);
+    let (view_start, view_end) = ed.view_range;
+    let visible_start = view_start.max(0.0);
+    let visible_end = view_end.min(1.0);
+    let visible_fraction = ((visible_end - visible_start) / (view_end - view_start)).max(0.0);
+    let visible_buckets = ((num_buckets as f32 * visible_fraction).ceil() as usize).max(1);
     let peaks = if ed.freeze_view {
         let needs_snap = ed
             .frozen_peaks
@@ -70,9 +88,22 @@ fn draw_peaks(
             let snap = ed.ring.lock().waveform_peaks(num_buckets);
             ed.frozen_peaks = Some(snap);
         }
-        ed.frozen_peaks.clone().unwrap_or_default()
+        let snap = ed.frozen_peaks.as_ref().unwrap();
+        if snap.is_empty() {
+            Vec::new()
+        } else {
+            (0..visible_buckets)
+                .map(|i| {
+                    let t = visible_start
+                        + (i as f32 + 0.5) / visible_buckets as f32 * (visible_end - visible_start);
+                    snap[((t * snap.len() as f32) as usize).min(snap.len() - 1)]
+                })
+                .collect()
+        }
     } else {
-        ed.ring.lock().waveform_peaks(num_buckets)
+        ed.ring
+            .lock()
+            .waveform_peaks_range(visible_buckets, visible_start, visible_end)
     };
 
     if is_empty || peaks.is_empty() {
@@ -95,7 +126,8 @@ fn draw_peaks(
         let mut prev_bot: Option<egui::Pos2> = None;
 
         for (i, (l, r)) in peaks.iter().enumerate() {
-            let x = plot_rect.left() + (i as f32 + 0.5) / n * plot_rect.width();
+            let t = visible_start + (i as f32 + 0.5) / n * (visible_end - visible_start);
+            let x = x_at_t(t, plot_rect, ed.view_range);
             let raw_amp = ((*l).max(*r)).clamp(0.0, 1.0);
             let norm_amp = if max_peak > 1e-6 {
                 (raw_amp / max_peak).clamp(0.0, 1.0)
@@ -143,70 +175,156 @@ fn handle_pointer_interaction(
     plot_rect: egui::Rect,
     ed: &mut EditorState,
 ) -> bool {
-    let pointer_pos = response
-        .hover_pos()
-        .or_else(|| response.interact_pointer_pos());
+    // Read the pointer from global input instead of `response.hover_pos()`: egui clears a
+    // widget's hover flag while a button is held and the pointer is over another widget (or
+    // over this widget before the click is granted), so hover-derived positions go stale
+    // mid-gesture. `interact_pos` stays valid for as long as the pointer is in the window.
+    let input = ui.input(|i| i.clone());
+    let view = ed.view_range;
+    let pointer = input.pointer.interact_pos();
+    let pointer_in_plot = pointer.filter(|p| plot_rect.contains(*p));
+    let press_pos = input.pointer.press_origin();
+    let primary_pressed = input.pointer.button_pressed(egui::PointerButton::Primary);
+    let primary_down = input.pointer.button_down(egui::PointerButton::Primary);
+    let primary_released = input.pointer.button_released(egui::PointerButton::Primary);
+    let secondary_pressed = input.pointer.button_pressed(egui::PointerButton::Secondary);
+    let secondary_down = input.pointer.button_down(egui::PointerButton::Secondary);
+
     let mut hovering_edge = false;
     let mut hovering_inside_sel = false;
+    if let (Some(pos), Some((a, b))) = (pointer_in_plot, ed.selection) {
+        let x0 = x_at_t(a.min(b), plot_rect, view);
+        let x1 = x_at_t(a.max(b), plot_rect, view);
+        if (pos.x - x0).abs() <= EDGE_GRAB_PX || (pos.x - x1).abs() <= EDGE_GRAB_PX {
+            hovering_edge = true;
+        } else if pos.x > x0 && pos.x < x1 {
+            hovering_inside_sel = true;
+        }
+    }
 
-    if let (Some(pos), Some((a, b))) = (pointer_pos, ed.selection) {
-        if plot_rect.contains(pos) {
-            let x0 = plot_rect.left() + a.min(b) * plot_rect.width();
-            let x1 = plot_rect.left() + a.max(b) * plot_rect.width();
-            if (pos.x - x0).abs() <= EDGE_GRAB_PX || (pos.x - x1).abs() <= EDGE_GRAB_PX {
-                hovering_edge = true;
-            } else if pos.x > x0 && pos.x < x1 {
-                hovering_inside_sel = true;
+    if ed.is_panning {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if hovering_edge {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    } else if hovering_inside_sel {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    } else if pointer_in_plot.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    // Zoom with scroll wheel (cursor‑centered)
+    if let Some(pos) = pointer_in_plot {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 && plot_rect.contains(pos) {
+            let cursor_t = ((pos.x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0);
+            let factor = if scroll > 0.0 { 0.85 } else { 1.15 };
+            let (start, end) = ed.view_range;
+            let range = end - start;
+            let new_range = (range * factor).clamp(0.01, 1.0);
+            let cursor_abs = start + cursor_t * range;
+            let new_start =
+                (cursor_abs - cursor_t * new_range).clamp(-0.9 * new_range, 1.0 - 0.1 * new_range);
+            let new_end = new_start + new_range;
+            ed.view_range = (new_start, new_end);
+        }
+    }
+
+    // Double‑click resets zoom to full view
+    if response.double_clicked() && pointer_in_plot.is_some() {
+        ed.view_range = (0.0, 1.0);
+    }
+
+    // Right‑click drag pans the zoomed window through the buffer. Selection work is bound to
+    // the left button, so the right button is free to pan anywhere on the plot, including
+    // over an existing selection edge.
+
+    // Start pan from wherever the press landed.
+    if secondary_pressed {
+        if let Some(pos) = press_pos.or(pointer) {
+            if plot_rect.contains(pos) {
+                ed.is_panning = true;
+                ed.pan_start_pos = Some((pos.x - plot_rect.left()) / plot_rect.width());
+                ed.pan_start_range = ed.view_range;
             }
         }
     }
 
-    if hovering_edge {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-    } else if hovering_inside_sel {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-    } else if let Some(pos) = pointer_pos {
-        if plot_rect.contains(pos) {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-        }
+    // Continue pan: the pointer is free to leave the plot while the button is held. A drag
+    // across `fraction` of the plot width shifts the view by that fraction of its own span,
+    // so the sample under the pointer stays under the pointer.
+    if let (true, Some(start_t), Some(pos)) = (ed.is_panning, ed.pan_start_pos, pointer) {
+        let cur_t = (pos.x - plot_rect.left()) / plot_rect.width();
+        let (orig_start, orig_end) = ed.pan_start_range;
+        let range = (orig_end - orig_start).clamp(0.0, 1.0);
+        // Keep at least 10% of the view overlapping the recording, even at full zoom.
+        let new_start =
+            (orig_start - (cur_t - start_t) * range).clamp(-0.9 * range, 1.0 - 0.1 * range);
+        ed.view_range = (new_start, new_start + range);
     }
 
-    if let Some(pos) = response.interact_pointer_pos() {
-        let t = ((pos.x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0);
-        if response.drag_started() && plot_rect.contains(pos) {
-            if let Some((a, b)) = ed.selection {
-                let start_n = a.min(b);
-                let end_n = a.max(b);
-                let x0 = plot_rect.left() + start_n * plot_rect.width();
-                let x1 = plot_rect.left() + end_n * plot_rect.width();
-                if (pos.x - x0).abs() <= EDGE_GRAB_PX {
-                    ed.drag_anchor = Some(end_n);
-                    ed.selection = Some((t, end_n));
-                } else if (pos.x - x1).abs() <= EDGE_GRAB_PX {
-                    ed.drag_anchor = Some(start_n);
-                    ed.selection = Some((start_n, t));
-                } else if pos.x > x0 && pos.x < x1 {
-                    ed.status = drag_out_selection(ed);
-                    ed.drag_anchor = None;
+    // End pan whenever the button is no longer held, so a release over another widget can
+    // never leave the editor stuck in panning mode.
+    if ed.is_panning && !secondary_down {
+        ed.is_panning = false;
+        ed.pan_start_pos = None;
+    }
+
+    // Selection editing is left-button only. It is driven by explicit primary-button events
+    // instead of `Response::drag_*`, because egui reports a widget drag for *any* pointer
+    // button, which is how right-drags used to draw a selection as well.
+    if !ed.is_panning {
+        if primary_pressed {
+            if let Some(pos) = press_pos.filter(|p| {
+                plot_rect.contains(*p) && (0.0..=1.0).contains(&t_at_x(p.x, plot_rect, view))
+            }) {
+                let t = t_at_x(pos.x, plot_rect, view).clamp(0.0, 1.0);
+                ed.selection_body_press = false;
+                if let Some((a, b)) = ed.selection {
+                    let (start_n, end_n) = (a.min(b), a.max(b));
+                    let x0 = x_at_t(start_n, plot_rect, view);
+                    let x1 = x_at_t(end_n, plot_rect, view);
+                    if (pos.x - x0).abs() <= EDGE_GRAB_PX {
+                        ed.drag_anchor = Some(end_n);
+                        ed.selection = Some((t, end_n));
+                    } else if (pos.x - x1).abs() <= EDGE_GRAB_PX {
+                        ed.drag_anchor = Some(start_n);
+                        ed.selection = Some((start_n, t));
+                    } else if pos.x > x0 && pos.x < x1 {
+                        // Pressed inside the selection: dragging from here drags the clip out.
+                        ed.drag_anchor = None;
+                        ed.selection_body_press = true;
+                    } else {
+                        ed.drag_anchor = Some(t);
+                        ed.selection = Some((t, t));
+                    }
                 } else {
                     ed.drag_anchor = Some(t);
                     ed.selection = Some((t, t));
                 }
-            } else {
-                ed.drag_anchor = Some(t);
-                ed.selection = Some((t, t));
             }
-        } else if response.dragged() {
-            if let Some(anchor) = ed.drag_anchor {
-                ed.selection = Some((anchor, t));
+        } else if primary_down {
+            if let Some(pos) = pointer {
+                let t = t_at_x(pos.x, plot_rect, view).clamp(0.0, 1.0);
+                if let Some(anchor) = ed.drag_anchor {
+                    ed.selection = Some((anchor, t));
+                } else if ed.selection_body_press && input.pointer.is_decidedly_dragging() {
+                    ed.status = drag_out_selection(ed);
+                    ed.selection_body_press = false;
+                }
             }
-        } else if response.drag_stopped() {
+        }
+    }
+
+    // Finish the left-button gesture: drop click-without-drag selections and clear the anchor.
+    if primary_released {
+        ed.selection_body_press = false;
+        if ed.drag_anchor.take().is_some() {
             if let Some((a, b)) = ed.selection {
-                if (b - a).abs() * plot_rect.width() < 2.0 {
+                let span = (view.1 - view.0).max(f32::EPSILON);
+                if (b - a).abs() / span * plot_rect.width() < 2.0 {
                     ed.selection = None;
                 }
             }
-            ed.drag_anchor = None;
         }
     }
 
@@ -224,11 +342,19 @@ fn draw_selection_overlay(
     filled_frames: usize,
     cap_secs: f32,
     sr: f32,
+    view_range: (f32, f32),
 ) {
     let start_n = a.min(b);
     let end_n = a.max(b);
-    let x0 = plot_rect.left() + start_n * plot_rect.width();
-    let x1 = (plot_rect.left() + end_n * plot_rect.width()).max(x0 + 2.0);
+    let (view_start, view_end) = view_range;
+    if end_n < view_start || start_n > view_end {
+        return;
+    }
+    let x0 =
+        plot_rect.left() + ((start_n - view_start) / (view_end - view_start)) * plot_rect.width();
+    let x1 = (plot_rect.left()
+        + ((end_n - view_start) / (view_end - view_start)) * plot_rect.width())
+    .max(x0 + 2.0);
     let sel_rect = egui::Rect::from_min_max(
         egui::pos2(x0, plot_rect.top() + 1.0),
         egui::pos2(x1, plot_rect.bottom() - 1.0),
@@ -254,6 +380,9 @@ fn draw_selection_overlay(
         theme::ACCENT
     };
     for &edge_x in &[x0, x1] {
+        if edge_x < plot_rect.left() || edge_x > plot_rect.right() {
+            continue;
+        }
         let h_rect = egui::Rect::from_center_size(
             egui::pos2(
                 edge_x.clamp(plot_rect.left() + 3.0, plot_rect.right() - 3.0),
@@ -356,12 +485,197 @@ pub fn format_mm_ss_mmm(seconds: f32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use pirate_sampler_dsp::{BufferDuration, RingBuffer};
+
     use super::*;
+
+    const START: egui::Pos2 = egui::pos2(300.0, 150.0);
+
+    /// Headless egui harness: drives draw_waveform_card with synthetic pointer input.
+    struct Harness {
+        ctx: egui::Context,
+        ed: EditorState,
+    }
+
+    impl Harness {
+        fn new(view: (f32, f32), selection: Option<(f32, f32)>) -> Self {
+            let ring = RingBuffer::with_max_duration(48_000.0, BufferDuration::new(1.0));
+            let mut ed = EditorState::new(Arc::new(Mutex::new(ring)));
+            ed.view_range = view;
+            ed.selection = selection;
+            Self {
+                ctx: egui::Context::default(),
+                ed,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 300.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let ctx = self.ctx.clone();
+            let ed = &mut self.ed;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_waveform_card(
+                        ui,
+                        ed,
+                        ui.available_height(),
+                        48_000,
+                        1.0,
+                        48_000.0,
+                        false,
+                        false,
+                    );
+                });
+            });
+        }
+
+        fn hover(&mut self, pos: egui::Pos2) {
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+        }
+
+        fn button(&mut self, pos: egui::Pos2, button: egui::PointerButton, pressed: bool) {
+            self.frame(vec![egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            }]);
+        }
+
+        fn drag(&mut self, from: egui::Pos2, to: egui::Pos2, button: egui::PointerButton) {
+            self.hover(from);
+            self.button(from, button, true);
+            for step in 1..=4 {
+                let t = step as f32 / 4.0;
+                self.frame(vec![egui::Event::PointerMoved(from + (to - from) * t)]);
+            }
+            self.button(to, button, false);
+        }
+    }
 
     #[test]
     fn formats_duration_badge_correctly() {
         assert_eq!(format_mm_ss_mmm(0.0), "00:00.000");
         assert_eq!(format_mm_ss_mmm(1.87), "00:01.870");
         assert_eq!(format_mm_ss_mmm(65.125), "01:05.125");
+    }
+
+    #[test]
+    fn right_drag_pans_zoomed_view() {
+        // A selection covering the buffer must not block panning.
+        let mut h = Harness::new((0.25, 0.5), Some((0.0, 1.0)));
+        h.drag(
+            START,
+            START + egui::vec2(60.0, 0.0),
+            egui::PointerButton::Secondary,
+        );
+
+        // 60 px of a ~600 px plot shifts a 25%-wide view by roughly 0.025.
+        let start = h.ed.view_range.0;
+        assert!(
+            (0.21..0.24).contains(&start),
+            "right-drag should pan by the drag distance, got {start}"
+        );
+        assert!(
+            (h.ed.view_range.1 - start - 0.25).abs() < 1e-4,
+            "panning must keep the zoom level, got {:?}",
+            h.ed.view_range
+        );
+        assert!(!h.ed.is_panning, "release must end panning");
+        assert_eq!(
+            h.ed.selection,
+            Some((0.0, 1.0)),
+            "panning must not touch the selection"
+        );
+    }
+
+    #[test]
+    fn right_drag_pans_full_view_in_both_directions() {
+        for dx in [-80.0, 80.0] {
+            let mut h = Harness::new((0.0, 1.0), None);
+            h.drag(
+                START,
+                START + egui::vec2(dx, 0.0),
+                egui::PointerButton::Secondary,
+            );
+            assert!(
+                h.ed.view_range.0 * dx < 0.0,
+                "view should follow the drag: {:?}",
+                h.ed.view_range
+            );
+            assert!((h.ed.view_range.1 - h.ed.view_range.0 - 1.0).abs() < 1e-5);
+            assert_eq!(h.ed.selection, None);
+        }
+    }
+
+    #[test]
+    fn right_drag_never_draws_a_selection() {
+        let mut h = Harness::new((0.25, 0.5), None);
+        h.drag(
+            START,
+            START + egui::vec2(80.0, 0.0),
+            egui::PointerButton::Secondary,
+        );
+
+        assert_eq!(h.ed.selection, None, "right-drag must not select");
+        assert!(h.ed.view_range.0 < 0.25, "right-drag must still pan");
+    }
+
+    #[test]
+    fn left_drag_selects_audio_after_panning() {
+        let mut h = Harness::new((-0.2, 0.8), None);
+        h.drag(
+            egui::pos2(200.0, 150.0),
+            egui::pos2(380.0, 150.0),
+            egui::PointerButton::Primary,
+        );
+        let (a, b) = h.ed.selection.expect("left drag should select");
+        assert!(
+            (0.1..0.2).contains(&a),
+            "selection start must match the panned view: {a}"
+        );
+        assert!(
+            (0.4..0.5).contains(&b),
+            "selection end must match the panned view: {b}"
+        );
+    }
+
+    #[test]
+    fn left_click_without_drag_leaves_no_selection() {
+        let mut h = Harness::new((0.0, 1.0), None);
+        h.hover(START);
+        h.button(START, egui::PointerButton::Primary, true);
+        h.button(START, egui::PointerButton::Primary, false);
+
+        assert_eq!(h.ed.selection, None, "a bare left click must not select");
+    }
+
+    #[test]
+    fn left_drag_draws_a_selection() {
+        let mut h = Harness::new((0.0, 1.0), None);
+        h.drag(
+            egui::pos2(200.0, 150.0),
+            egui::pos2(380.0, 150.0),
+            egui::PointerButton::Primary,
+        );
+
+        let (a, b) = h.ed.selection.expect("left drag should select");
+        assert!(
+            b - a > 0.1,
+            "selection should follow the drag, got {a}..{b}"
+        );
+        assert_eq!(h.ed.view_range, (0.0, 1.0), "selecting must not pan");
+        assert!(!h.ed.selection_body_press);
     }
 }
