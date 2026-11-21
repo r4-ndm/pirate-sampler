@@ -33,7 +33,6 @@ pub const WAVEFORM_H: f32 = WINDOW_H - VERTICAL_MARGINS;
 
 // Side-panel block heights for deterministic overflow calculation
 const H_BRAND: f32 = 24.0;
-const H_STATUS_STRIP: f32 = 14.0;
 const H_SOURCE_TOGGLE: f32 = 54.0; // 24 + 6 + 24
 const H_BUFFER: f32 = 34.0; // 14 label + 2 gap + 18 slider
 const H_TRANSPORT: f32 = 108.0; // 4 * 24 + 3 * 4
@@ -44,23 +43,16 @@ const H_STATUS_LINE: f32 = 14.0;
 const SECTION_GAP: f32 = 6.0;
 
 pub const FULL_STACK_NEEDED_H: f32 = H_BRAND
-    + H_STATUS_STRIP
     + H_SOURCE_TOGGLE
     + H_BUFFER
     + H_TRANSPORT
     + H_EXPORT
     + H_METER
     + H_STATUS_LINE
-    + 7.0 * SECTION_GAP;
-
-pub const TIER1_STACK_NEEDED_H: f32 = H_BRAND
-    + H_STATUS_STRIP
-    + H_SOURCE_TOGGLE
-    + H_BUFFER
-    + H_EXPORT
-    + H_MORE_BTN
-    + H_METER
     + 6.0 * SECTION_GAP;
+
+pub const TIER1_STACK_NEEDED_H: f32 =
+    H_BRAND + H_SOURCE_TOGGLE + H_BUFFER + H_EXPORT + H_MORE_BTN + H_METER + 5.0 * SECTION_GAP;
 
 pub struct EditorState {
     pub ring: Arc<Mutex<RingBuffer>>,
@@ -160,10 +152,6 @@ pub fn create(
             handle_keyboard_shortcuts(egui_ctx, setter, &params, &mut ed);
 
             let paused = params.pause.value();
-            let buf_pct = ((filled_frames as f32 / capacity_frames.max(1) as f32) * 100.0)
-                .clamp(0.0, 100.0)
-                .round() as u32;
-            let sr_khz = sr / 1000.0;
 
             egui::SidePanel::right("side_panel")
                 .resizable(false)
@@ -182,8 +170,6 @@ pub fn create(
                         setter,
                         &params,
                         &mut ed,
-                        sr_khz,
-                        buf_pct,
                         db,
                         cur_norm,
                         peak_hold_norm,
@@ -319,8 +305,6 @@ fn draw_side_panel(
     setter: &ParamSetter,
     params: &Arc<PirateSamplerParams>,
     ed: &mut EditorState,
-    sr_khz: f32,
-    buf_pct: u32,
     db: f32,
     cur_norm: f32,
     peak_hold_norm: f32,
@@ -407,24 +391,6 @@ fn draw_side_panel(
         if draw_minimize_button(ui, min_btn, "minimize_btn") {
             crate::chrome::minimize();
         }
-    }
-
-    if !compact && ui.available_height() >= H_STATUS_STRIP {
-        let sr_label = if (sr_khz - sr_khz.round()).abs() < 0.05 {
-            format!("{:.0} kHz", sr_khz)
-        } else {
-            format!("{:.1} kHz", sr_khz)
-        };
-        let strip_text = format!("{} · {}% buf", sr_label, buf_pct);
-        let (strip_rect, _) =
-            ui.allocate_exact_size(egui::vec2(full_w, H_STATUS_STRIP), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(strip_rect.left(), strip_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            strip_text,
-            theme::font_small(),
-            theme::MUTED,
-        );
     }
 
     // Pinned System Audio and Microphone buttons (always visible: stacked when tall enough, side-by-side when reduced to one button row)
