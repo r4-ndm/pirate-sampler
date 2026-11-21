@@ -364,7 +364,7 @@ fn draw_side_panel(
             egui::pos2(brand_rect.left(), brand_rect.center().y - badge_size * 0.5),
             egui::vec2(badge_size, badge_size),
         );
-        draw_logo_mark(ui.painter(), badge_rect);
+        draw_logo_mark(ui, ui.painter(), badge_rect);
         if !compact && !skull_only {
             ui.painter().text(
                 egui::pos2(badge_rect.right() + 6.0, brand_rect.center().y),
@@ -667,7 +667,7 @@ fn draw_minimize_button(ui: &mut egui::Ui, rect: egui::Rect, id: &str) -> bool {
     resp.clicked()
 }
 
-fn draw_logo_mark(painter: &egui::Painter, badge_rect: egui::Rect) {
+fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect) {
     painter.rect_filled(badge_rect, egui::CornerRadius::same(4), theme::CARD);
     painter.rect_stroke(
         badge_rect,
@@ -676,44 +676,31 @@ fn draw_logo_mark(painter: &egui::Painter, badge_rect: egui::Rect) {
         egui::StrokeKind::Inside,
     );
 
-    let c = badge_rect.center();
-    let scale = (badge_rect.width() / 28.0).clamp(0.5, 1.5);
-    let bone_stroke = egui::Stroke::new((1.4 * scale).max(1.0), theme::TEXT);
+    // Cached raw RGBA texture loaded from the pre-rasterized M & crossbones SVG
+    const RAW_LOGO_RGBA: &[u8] = include_bytes!("m-and-bones-128.rgba");
+    let tex_id = egui::Id::new("pirate_sampler_m_bones_logo_tex");
+    let texture = ui.ctx().data_mut(|d| {
+        if let Some(handle) = d.get_temp::<egui::TextureHandle>(tex_id) {
+            handle
+        } else {
+            let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], RAW_LOGO_RGBA);
+            let handle = ui.ctx().load_texture(
+                "pirate_sampler_m_bones_logo",
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            d.insert_temp(tex_id, handle.clone());
+            handle
+        }
+    });
 
-    let d = 7.5 * scale;
-    painter.line_segment(
-        [
-            egui::pos2(c.x - d, c.y - d + 0.8 * scale),
-            egui::pos2(c.x + d, c.y + d - 0.8 * scale),
-        ],
-        bone_stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(c.x - d, c.y + d - 0.8 * scale),
-            egui::pos2(c.x + d, c.y - d + 0.8 * scale),
-        ],
-        bone_stroke,
-    );
-
-    let skull_c = egui::pos2(c.x, c.y - 1.2 * scale);
-    painter.circle_filled(skull_c, 5.4 * scale, theme::CARD);
-    painter.circle_filled(skull_c, 4.5 * scale, theme::TEXT);
-    let jaw_rect = egui::Rect::from_center_size(
-        egui::pos2(c.x, c.y + 3.2 * scale),
-        egui::vec2(4.8 * scale, 3.0 * scale),
-    );
-    painter.rect_filled(jaw_rect, egui::CornerRadius::same(1), theme::TEXT);
-
-    painter.circle_filled(
-        egui::pos2(c.x - 1.7 * scale, c.y - 1.4 * scale),
-        (1.2 * scale).max(0.9),
-        theme::BG,
-    );
-    painter.circle_filled(
-        egui::pos2(c.x + 1.7 * scale, c.y - 1.4 * scale),
-        (1.2 * scale).max(0.9),
-        theme::BG,
+    // Inset slightly inside the card badge for clean margins
+    let inner_rect = badge_rect.shrink(1.5);
+    painter.image(
+        texture.id(),
+        inner_rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
     );
 }
 
@@ -821,7 +808,7 @@ fn draw_side_by_side_source_toggle(
 
     let start_x = if show_inline_logo {
         let badge_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(seg_h, seg_h));
-        draw_logo_mark(ui.painter(), badge_rect);
+        draw_logo_mark(ui, ui.painter(), badge_rect);
         let drag_resp = ui.interact(
             badge_rect,
             ui.id().with("inline_logo_drag"),
