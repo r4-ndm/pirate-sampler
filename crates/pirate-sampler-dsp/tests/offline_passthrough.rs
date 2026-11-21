@@ -1,6 +1,6 @@
 //! Offline acceptance: pass-through equals input (SPEC A4).
 
-use pirate_sampler_dsp::{BufferDuration, RingBuffer, Selection, write_selection_wav};
+use pirate_sampler_dsp::{write_selection_wav, BufferDuration, RingBuffer, Selection};
 
 #[test]
 fn offline_process_passthrough_and_capture() {

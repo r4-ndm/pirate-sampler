@@ -11,8 +11,8 @@ mod ring;
 
 pub use export::{write_selection_wav, WavExportError};
 pub use params::{
-    buffer_capacity_frames, BufferDuration, BUFFER_DURATION_DEFAULT_SECS,
-    BUFFER_DURATION_MAX_SECS, BUFFER_DURATION_MIN_SECS, NUM_CHANNELS,
+    buffer_capacity_frames, BufferDuration, BUFFER_DURATION_DEFAULT_SECS, BUFFER_DURATION_MAX_SECS,
+    BUFFER_DURATION_MIN_SECS, NUM_CHANNELS,
 };
 pub use ring::{RingBuffer, Selection};
 

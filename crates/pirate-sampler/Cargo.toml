@@ -30,3 +30,6 @@ hound.workspace = true
 # standalone build. Already in the dependency graph via baseview.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
+
+[lints]
+workspace = true

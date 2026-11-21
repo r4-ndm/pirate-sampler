@@ -113,10 +113,10 @@ pub enum WrapperError {
     InitializationFailed,
 }
 
-struct WrapperWindowHandler {
+struct WrapperWindowHandler<P: Plugin, B: Backend<P>> {
     /// The editor handle for the plugin's open editor. The editor should clean itself up when it
     /// gets dropped.
-    _editor_handle: Box<dyn Any>,
+    editor_handle: Option<Box<dyn Any>>,
 
     /// Shared reference to the plugin's editor, used to forward parent window resize events.
     editor: Arc<Mutex<Box<dyn Editor>>>,
@@ -127,6 +127,43 @@ struct WrapperWindowHandler {
     /// This is used to communicate with the wrapper from the audio thread and from within the
     /// baseview window handler on the GUI thread.
     gui_task_receiver: channel::Receiver<GuiTask>,
+
+    wrapper: Arc<Wrapper<P, B>>,
+    terminate_audio_thread: Arc<AtomicBool>,
+    audio_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    has_shut_down: bool,
+}
+
+impl<P: Plugin, B: Backend<P>> WrapperWindowHandler<P, B> {
+    fn shutdown_audio_and_jack(&mut self) {
+        if self.has_shut_down {
+            return;
+        }
+        self.has_shut_down = true;
+
+        // 1. Signal audio thread to terminate and wake the backend immediately
+        self.terminate_audio_thread.store(true, Ordering::SeqCst);
+        self.wrapper.shutdown_audio();
+
+        // 2. Wait for audio thread to finish. This deactivates and closes the JACK client
+        //    BEFORE any GL / egui contexts are destroyed.
+        let handle = self.audio_thread.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+
+        // 3. Deactivate plugin
+        self.wrapper.plugin.lock().deactivate();
+
+        // 4. Drop editor handle, which closes the child egui window and waits for GL destruction
+        drop(self.editor_handle.take());
+    }
+}
+
+impl<P: Plugin, B: Backend<P>> Drop for WrapperWindowHandler<P, B> {
+    fn drop(&mut self) {
+        self.shutdown_audio_and_jack();
+    }
 }
 
 /// A message sent to the GUI thread.
@@ -137,7 +174,7 @@ pub enum GuiTask {
     Close,
 }
 
-impl WindowHandler for WrapperWindowHandler {
+impl<P: Plugin, B: Backend<P>> WindowHandler for WrapperWindowHandler<P, B> {
     fn on_frame(&mut self, window: &mut Window) {
         while let Ok(task) = self.gui_task_receiver.try_recv() {
             match task {
@@ -147,24 +184,33 @@ impl WindowHandler for WrapperWindowHandler {
                         height: new_height as f64,
                     });
                 }
-                GuiTask::Close => window.close(),
+                GuiTask::Close => {
+                    self.shutdown_audio_and_jack();
+                    window.close();
+                }
             }
         }
     }
 
     fn on_event(&mut self, _window: &mut Window, event: baseview::Event) -> EventStatus {
-        if let baseview::Event::Window(baseview::WindowEvent::Resized(info)) = event {
-            let logical = info.logical_size();
-            let new_size = (
-                logical.width.round().max(1.0) as u32,
-                logical.height.round().max(1.0) as u32,
-            );
-            if new_size != self.last_forwarded_size {
-                if let Some(mut editor) = self.editor.try_lock() {
-                    self.last_forwarded_size = new_size;
-                    editor.on_parent_resized(new_size.0, new_size.1);
+        match event {
+            baseview::Event::Window(baseview::WindowEvent::Resized(info)) => {
+                let logical = info.logical_size();
+                let new_size = (
+                    logical.width.round().max(1.0) as u32,
+                    logical.height.round().max(1.0) as u32,
+                );
+                if new_size != self.last_forwarded_size {
+                    if let Some(mut editor) = self.editor.try_lock() {
+                        self.last_forwarded_size = new_size;
+                        editor.on_parent_resized(new_size.0, new_size.1);
+                    }
                 }
             }
+            baseview::Event::Window(baseview::WindowEvent::WillClose) => {
+                self.shutdown_audio_and_jack();
+            }
+            _ => {}
         }
 
         EventStatus::Ignored
@@ -322,6 +368,11 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         Ok(wrapper)
     }
 
+    /// Signal the audio backend to shut down.
+    pub fn shutdown_audio(&self) {
+        self.backend.borrow().shutdown();
+    }
+
     /// Open the editor, start processing audio, and block this thread until the editor is closed.
     /// If the plugin does not have an editor, then this will block until SIGINT is received.
     ///
@@ -334,11 +385,12 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         // We'll spawn a separate thread to handle IO and to process audio. This audio thread should
         // terminate together with this function.
         let terminate_audio_thread = Arc::new(AtomicBool::new(false));
-        let audio_thread = {
+        let audio_thread_handle = {
             let this = self.clone();
             let terminate_audio_thread = terminate_audio_thread.clone();
             thread::spawn(move || this.run_audio_thread(terminate_audio_thread, gui_task_sender))
         };
+        let audio_thread = Arc::new(Mutex::new(Some(audio_thread_handle)));
 
         match self.editor.borrow().clone() {
             Some(editor) => {
@@ -354,6 +406,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 };
 
                 let (width, height) = editor.lock().size();
+                let this = self.clone();
+                let handler_terminate = terminate_audio_thread.clone();
+                let handler_audio_thread = audio_thread.clone();
                 Window::open_blocking(
                     WindowOpenOptions {
                         title: String::from(P::NAME),
@@ -388,10 +443,14 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                         let editor_handle = editor.lock().spawn(parent_handle, context);
 
                         WrapperWindowHandler {
-                            _editor_handle: editor_handle,
+                            editor_handle: Some(editor_handle),
                             editor,
                             last_forwarded_size: (width, height),
                             gui_task_receiver,
+                            wrapper: this,
+                            terminate_audio_thread: handler_terminate,
+                            audio_thread: handler_audio_thread,
+                            has_shut_down: false,
                         }
                     },
                 )
@@ -404,8 +463,12 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             }
         }
 
+        // Fallback cleanup if not already shut down (e.g. headless or abnormal exit)
         terminate_audio_thread.store(true, Ordering::SeqCst);
-        audio_thread.join().unwrap();
+        self.shutdown_audio();
+        if let Some(handle) = audio_thread.lock().take() {
+            let _ = handle.join();
+        }
 
         // Some plugins may use this to clean up resources. Should not be needed for the standalone
         // application, but it seems like a good idea to stay consistent.

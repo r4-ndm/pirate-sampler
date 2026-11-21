@@ -1,7 +1,11 @@
-mod chrome;
-mod editor;
-mod params;
+pub mod chrome;
+pub mod clips;
+pub mod editor;
+pub mod params;
+pub mod routing;
 pub mod theme;
+pub mod waveform;
+pub mod xdnd;
 
 use std::sync::Arc;
 
@@ -98,6 +102,10 @@ impl Plugin for PirateSampler {
         self.ring.lock().clear();
     }
 
+    fn deactivate(&mut self) {
+        self.ring.lock().set_paused(true);
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -188,16 +196,18 @@ mod tests {
     fn default_params_in_spec_range() {
         let p = PirateSamplerParams::default();
         let secs = p.buffer_seconds.default_plain_value();
-        assert!(secs >= 30.0 && secs <= 600.0);
+        assert!((30.0..=600.0).contains(&secs));
     }
 
     #[test]
     fn side_panel_and_min_waveform_fit_window_width() {
-        assert!(
-            editor::SIDE_W + editor::MIN_WAVEFORM_W + editor::HORIZONTAL_MARGINS
-                <= editor::WINDOW_W,
-            "side panel + min waveform + margins exceeds window width"
-        );
+        const {
+            assert!(
+                editor::SIDE_W + editor::MIN_WAVEFORM_W + editor::HORIZONTAL_MARGINS
+                    <= editor::WINDOW_W,
+                "side panel + min waveform + margins exceeds window width"
+            );
+        }
         assert_eq!(
             editor::WAVEFORM_H,
             editor::WINDOW_H - editor::VERTICAL_MARGINS,

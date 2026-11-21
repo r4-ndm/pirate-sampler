@@ -22,6 +22,10 @@ impl Selection {
     pub fn len(self) -> usize {
         self.end - self.start
     }
+
+    pub fn is_empty(self) -> bool {
+        self.end <= self.start
+    }
 }
 
 /// Preallocated stereo ring buffer. Audio-thread writes must not allocate.
@@ -50,7 +54,10 @@ impl RingBuffer {
 
     /// Allocate for the maximum v1 duration at `sample_rate`, start at `duration`.
     pub fn with_max_duration(sample_rate: f32, duration: BufferDuration) -> Self {
-        let storage = buffer_capacity_frames(sample_rate, BufferDuration::new(crate::BUFFER_DURATION_MAX_SECS));
+        let storage = buffer_capacity_frames(
+            sample_rate,
+            BufferDuration::new(crate::BUFFER_DURATION_MAX_SECS),
+        );
         let active = buffer_capacity_frames(sample_rate, duration).min(storage);
         let mut rb = Self::with_capacity(sample_rate, storage);
         rb.capacity = active.max(1);

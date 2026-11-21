@@ -29,3 +29,13 @@ atomic_float = "1.1"
 nih_plug = { path = "vendor/nih-plug" }
 nih_plug_egui = { path = "vendor/nih-plug/nih_plug_egui" }
 nih_plug_xtask = { path = "vendor/nih-plug/nih_plug_xtask" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

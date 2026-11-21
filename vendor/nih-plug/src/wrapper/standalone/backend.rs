@@ -28,4 +28,7 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
             + 'static
             + Send,
     );
+
+    /// Signal the backend to shut down and close any audio/MIDI clients.
+    fn shutdown(&self) {}
 }

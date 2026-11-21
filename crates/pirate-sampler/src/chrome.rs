@@ -18,7 +18,10 @@
 //! a non-X11 platform), so the GUI never depends on this module succeeding.
 
 #[cfg(target_os = "linux")]
-pub use imp::{attach, begin_move, begin_resize, minimize, pump_move, pump_resize};
+pub use imp::{
+    attach, begin_move, begin_resize, ensure_min_height, minimize, pump_move, pump_resize,
+    set_always_on_top,
+};
 
 /// Anything that is not X11 (or not supported) gets no-ops.
 #[cfg(not(target_os = "linux"))]
@@ -29,6 +32,8 @@ mod imp {
     pub fn pump_move() {}
     pub fn begin_resize() {}
     pub fn pump_resize() {}
+    pub fn set_always_on_top(_on_top: bool) {}
+    pub fn ensure_min_height(_min_h: Option<u32>) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -73,6 +78,7 @@ mod imp {
     static CHROME: Mutex<Option<Chrome>> = Mutex::new(None);
     static MOVE: Mutex<Option<MoveState>> = Mutex::new(None);
     static RESIZE: Mutex<Option<ResizeState>> = Mutex::new(None);
+    static MENU_EXPANDED_FROM: Mutex<Option<u32>> = Mutex::new(None);
 
     fn intern(conn: &RustConnection, name: &[u8]) -> Option<u32> {
         conn.intern_atom(false, name)
@@ -118,17 +124,27 @@ mod imp {
 
         // _MOTIF_WM_HINTS: flags = MWM_HINTS_DECORATIONS (2), decorations = 0
         if let Some(motif) = intern(&conn, b"_MOTIF_WM_HINTS") {
-            let _ = conn.change_property32(PropMode::REPLACE, window, motif, motif, &[2u32, 0, 0, 0, 0]);
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                motif,
+                motif,
+                &[2u32, 0, 0, 0, 0],
+            );
         }
         // KWin hands the titlebar's space back to the client when the decorations go
         // away, which would leave the window taller than the layout asks for. Put it
         // back to the app's own size; the egui child follows via the resize hook.
-        let _ = conn.configure_window(window, &ConfigureWindowAux::new().width(width).height(height));
+        let _ = conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().width(width).height(height),
+        );
         let _ = conn.flush();
 
         if let Ok(mut slot) = CHROME.lock() {
             *slot = Some(Chrome { conn, root, window });
         }
+        set_always_on_top(true);
     }
 
     fn send_client_message(chrome: &Chrome, message_type: u32, data: [u32; 5]) {
@@ -140,6 +156,76 @@ mod imp {
             event,
         );
         let _ = chrome.conn.flush();
+    }
+
+    /// Set or clear the EWMH _NET_WM_STATE_ABOVE flag (Always on Top).
+    pub fn set_always_on_top(on_top: bool) {
+        with_chrome(|chrome| {
+            let Some(net_wm_state) = intern(&chrome.conn, b"_NET_WM_STATE") else {
+                return;
+            };
+            let Some(net_wm_state_above) = intern(&chrome.conn, b"_NET_WM_STATE_ABOVE") else {
+                return;
+            };
+            // _NET_WM_STATE action: 0 = _NET_WM_STATE_REMOVE, 1 = _NET_WM_STATE_ADD
+            let action = if on_top { 1u32 } else { 0u32 };
+            send_client_message(chrome, net_wm_state, [action, net_wm_state_above, 0, 1, 0]);
+        });
+    }
+
+    /// Temporarily expand the window downward when  is  and the
+    /// current window height is smaller than , then restore the original
+    /// compact height when  becomes .
+    pub fn ensure_min_height(min_h: Option<u32>) {
+        with_chrome(|chrome| match min_h {
+            Some(req_h) => {
+                let already_checked = MENU_EXPANDED_FROM
+                    .lock()
+                    .ok()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if already_checked {
+                    return;
+                }
+                let Ok(cookie) = chrome.conn.get_geometry(chrome.window) else {
+                    return;
+                };
+                let Ok(geom) = cookie.reply() else {
+                    return;
+                };
+                let cur_h = geom.height as u32;
+                if cur_h < req_h {
+                    if let Ok(mut slot) = MENU_EXPANDED_FROM.lock() {
+                        *slot = Some(cur_h);
+                    }
+                    let _ = chrome
+                        .conn
+                        .configure_window(chrome.window, &ConfigureWindowAux::new().height(req_h));
+                    let _ = chrome.conn.flush();
+                } else if let Ok(mut slot) = MENU_EXPANDED_FROM.lock() {
+                    // Mark as checked with cur_h so we don't query geometry every frame while open
+                    *slot = Some(cur_h);
+                }
+            }
+            None => {
+                let prev = MENU_EXPANDED_FROM.lock().ok().and_then(|mut g| g.take());
+                if let Some(orig_h) = prev {
+                    let Ok(cookie) = chrome.conn.get_geometry(chrome.window) else {
+                        return;
+                    };
+                    let Ok(geom) = cookie.reply() else {
+                        return;
+                    };
+                    if (geom.height as u32) != orig_h {
+                        let _ = chrome.conn.configure_window(
+                            chrome.window,
+                            &ConfigureWindowAux::new().height(orig_h),
+                        );
+                        let _ = chrome.conn.flush();
+                    }
+                }
+            }
+        });
     }
 
     /// ICCCM minimize: ask the WM to iconify the window.
@@ -155,6 +241,12 @@ mod imp {
 
     /// Remember where the pointer and the window were when the drag started.
     pub fn begin_move() {
+        if let Ok(guard) = RESIZE.lock() {
+            if guard.is_some() {
+                // Never start moving the window while a resize is active.
+                return;
+            }
+        }
         if let Ok(guard) = MOVE.lock() {
             if guard.is_some() {
                 // A second draggable zone starting mid-drag must not re-base the anchor.
@@ -186,6 +278,13 @@ mod imp {
 
     /// Remember where the pointer and the window size were when the grip was pressed.
     pub fn begin_resize() {
+        if let Ok(mut exp) = MENU_EXPANDED_FROM.lock() {
+            *exp = None;
+        }
+        if let Ok(mut move_slot) = MOVE.lock() {
+            // Cancel any move that panel_bg_drag may have started in the same frame.
+            *move_slot = None;
+        }
         if let Ok(guard) = RESIZE.lock() {
             if guard.is_some() {
                 return;

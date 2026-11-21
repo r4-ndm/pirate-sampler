@@ -232,7 +232,11 @@ unsafe impl Send for EguiEditorHandle {}
 impl Drop for EguiEditorHandle {
     fn drop(&mut self) {
         self.egui_state.open.store(false, Ordering::Release);
-        // XXX: This should automatically happen when the handle gets dropped, but apparently not
         self.window.close();
+        // Wait for the window thread to finish tearing down the GL/egui context
+        let start = std::time::Instant::now();
+        while self.window.is_open() && start.elapsed() < std::time::Duration::from_millis(500) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

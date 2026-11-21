@@ -45,7 +45,7 @@ pub fn write_selection_wav(
     selection: Selection,
     path: impl AsRef<Path>,
 ) -> Result<(), WavExportError> {
-    if selection.len() == 0 {
+    if selection.is_empty() {
         return Err(WavExportError::EmptySelection);
     }
     let samples = buffer

@@ -1,7 +1,9 @@
 use std::borrow::Borrow;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam::sync::Parker;
@@ -35,6 +37,9 @@ pub struct Jack {
     aux_output_ports: Arc<Mutex<Vec<Vec<Port<AudioOut>>>>>,
     midi_input: Option<Arc<Port<MidiIn>>>,
     midi_output: Option<Arc<Mutex<Port<MidiOut>>>>,
+
+    unparker: Arc<Mutex<Option<crossbeam::sync::Unparker>>>,
+    is_running: Arc<AtomicBool>,
 }
 
 /// Send+Sync wrapper for `Vec<*mut f32>` so we can preallocate channel pointer vectors for use with
@@ -108,6 +113,8 @@ impl<P: Plugin> Backend<P> for Jack {
         // This thread needs to be blocked until processing is finished
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
+        *self.unparker.lock() = Some(unparker.clone());
+        self.is_running.store(true, Ordering::SeqCst);
 
         let config = self.config.clone();
         let main_inputs = self.main_inputs.clone();
@@ -116,7 +123,14 @@ impl<P: Plugin> Backend<P> for Jack {
         let aux_output_ports = self.aux_output_ports.clone();
         let midi_input = self.midi_input.clone();
         let midi_output = self.midi_output.clone();
+        let is_running_cb = self.is_running.clone();
+        let unparker_cb = unparker.clone();
         let process_handler = ClosureProcessHandler::new(move |client, ps| {
+            if !is_running_cb.load(Ordering::SeqCst) {
+                unparker_cb.unpark();
+                return Control::Quit;
+            }
+
             let num_frames = ps.n_frames();
 
             let mut transport = Transport::new(client.sample_rate() as f32);
@@ -285,6 +299,7 @@ impl<P: Plugin> Backend<P> for Jack {
 
                 Control::Continue
             } else {
+                is_running_cb.store(false, Ordering::SeqCst);
                 unparker.unpark();
                 Control::Quit
             }
@@ -298,13 +313,38 @@ impl<P: Plugin> Backend<P> for Jack {
             nih_error!("Error connecting JACK ports: {err}")
         }
 
-        // The process callback happens on another thread, so we need to block this thread until we
-        // get the request to shut down or until the process callback runs into an error
-        parker.park();
+        // Wait until shut down, periodically checking is_running so we can never hang
+        while self.is_running.load(Ordering::SeqCst) {
+            parker.park_timeout(Duration::from_millis(50));
+        }
 
-        // And put the client back where it belongs in case this function is called a second time
-        let (client, _, _) = async_client.deactivate().unwrap();
-        self.client = Some(client);
+        *self.unparker.lock() = None;
+
+        // Deactivate and cleanly close the JACK client right now on the audio thread
+        match async_client.deactivate() {
+            Ok((client, _, _)) => {
+                drop(client);
+            }
+            Err(err) => {
+                nih_error!("Error deactivating JACK client: {err:?}");
+            }
+        }
+        self.client = None;
+    }
+
+    fn shutdown(&self) {
+        self.is_running.store(false, Ordering::SeqCst);
+        if let Some(unparker) = self.unparker.lock().as_ref() {
+            unparker.unpark();
+        }
+    }
+}
+
+impl Drop for Jack {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            drop(client);
+        }
     }
 }
 
@@ -418,6 +458,9 @@ impl Jack {
             aux_output_ports: Arc::new(Mutex::new(aux_output_ports)),
             midi_input,
             midi_output,
+
+            unparker: Arc::new(Mutex::new(None)),
+            is_running: Arc::new(AtomicBool::new(false)),
         })
     }
 

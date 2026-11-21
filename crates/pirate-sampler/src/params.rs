@@ -35,11 +35,7 @@ impl Default for PirateSamplerParams {
             .with_step_size(1.0)
             .with_value_to_string(formatters::v2s_f32_rounded(0))
             .with_string_to_value(Arc::new(|s| {
-                s.trim()
-                    .trim_end_matches('s')
-                    .trim()
-                    .parse::<f32>()
-                    .ok()
+                s.trim().trim_end_matches('s').trim().parse::<f32>().ok()
             })),
             bypass: BoolParam::new("Bypass", false),
         }
