@@ -359,10 +359,10 @@ fn draw_side_panel(
         let brand_h = if compact { 16.0 } else { H_BRAND };
         let (brand_rect, _) =
             ui.allocate_exact_size(egui::vec2(full_w, brand_h), egui::Sense::hover());
-        let badge_size = if compact { 16.0 } else { 22.0 };
+        let (badge_w, badge_h) = if compact { (19.0, 16.0) } else { (26.0, 22.0) };
         let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(brand_rect.left(), brand_rect.center().y - badge_size * 0.5),
-            egui::vec2(badge_size, badge_size),
+            egui::pos2(brand_rect.left(), brand_rect.center().y - badge_h * 0.5),
+            egui::vec2(badge_w, badge_h),
         );
         draw_logo_mark(ui, ui.painter(), badge_rect);
         if !compact && !skull_only {
@@ -668,14 +668,14 @@ fn draw_minimize_button(ui: &mut egui::Ui, rect: egui::Rect, id: &str) -> bool {
 }
 
 fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect) {
-    // Cached raw RGBA texture loaded from the pre-rasterized M & crossbones SVG
-    const RAW_LOGO_RGBA: &[u8] = include_bytes!("m-and-bones-128.rgba");
+    // 52 x 44 RGBA buffer rasterized directly at 2x native aspect ratio for retina clarity
+    const RAW_LOGO_RGBA: &[u8] = include_bytes!("m-and-bones.rgba");
     let tex_id = egui::Id::new("pirate_sampler_m_bones_logo_tex");
     let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(tex_id));
     let texture = match cached {
         Some(handle) => handle,
         None => {
-            let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], RAW_LOGO_RGBA);
+            let image = egui::ColorImage::from_rgba_unmultiplied([52, 44], RAW_LOGO_RGBA);
             let handle = ui.ctx().load_texture(
                 "pirate_sampler_m_bones_logo",
                 image,
@@ -797,7 +797,9 @@ fn draw_side_by_side_source_toggle(
     let (row_rect, _) = ui.allocate_exact_size(egui::vec2(width, seg_h), egui::Sense::hover());
 
     let start_x = if show_inline_logo {
-        let badge_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(seg_h, seg_h));
+        let badge_h = seg_h;
+        let badge_w = (seg_h * (52.0 / 44.0)).round();
+        let badge_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(badge_w, badge_h));
         draw_logo_mark(ui, ui.painter(), badge_rect);
         let drag_resp = ui.interact(
             badge_rect,
