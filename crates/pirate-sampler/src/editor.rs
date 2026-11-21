@@ -359,7 +359,7 @@ fn draw_side_panel(
         let brand_h = if compact { 16.0 } else { H_BRAND };
         let (brand_rect, _) =
             ui.allocate_exact_size(egui::vec2(full_w, brand_h), egui::Sense::hover());
-        let badge_size = if compact { 14.0 } else { 20.0 };
+        let badge_size = if compact { 16.0 } else { 22.0 };
         let badge_rect = egui::Rect::from_min_size(
             egui::pos2(brand_rect.left(), brand_rect.center().y - badge_size * 0.5),
             egui::vec2(badge_size, badge_size),
@@ -668,14 +668,6 @@ fn draw_minimize_button(ui: &mut egui::Ui, rect: egui::Rect, id: &str) -> bool {
 }
 
 fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect) {
-    painter.rect_filled(badge_rect, egui::CornerRadius::same(4), theme::CARD);
-    painter.rect_stroke(
-        badge_rect,
-        egui::CornerRadius::same(4),
-        egui::Stroke::new(1.0_f32, theme::STROKE),
-        egui::StrokeKind::Inside,
-    );
-
     // Cached raw RGBA texture loaded from the pre-rasterized M & crossbones SVG
     const RAW_LOGO_RGBA: &[u8] = include_bytes!("m-and-bones-128.rgba");
     let tex_id = egui::Id::new("pirate_sampler_m_bones_logo_tex");
@@ -694,11 +686,9 @@ fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect
         }
     };
 
-    // Inset slightly inside the card badge for clean margins
-    let inner_rect = badge_rect.shrink(1.5);
     painter.image(
         texture.id(),
-        inner_rect,
+        badge_rect,
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         Color32::WHITE,
     );
