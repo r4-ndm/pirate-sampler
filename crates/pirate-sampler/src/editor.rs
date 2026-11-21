@@ -32,7 +32,7 @@ pub const VERTICAL_MARGINS: f32 = (TOP_MARGIN as f32) + (BOTTOM_MARGIN as f32);
 pub const WAVEFORM_H: f32 = WINDOW_H - VERTICAL_MARGINS;
 
 // Side-panel block heights for deterministic overflow calculation
-const H_BRAND: f32 = 20.0;
+const H_BRAND: f32 = 24.0;
 const H_STATUS_STRIP: f32 = 14.0;
 const H_SOURCE_TOGGLE: f32 = 54.0; // 24 + 6 + 24
 const H_BUFFER: f32 = 34.0; // 14 label + 2 gap + 18 slider
@@ -356,7 +356,7 @@ fn draw_side_panel(
     let skull_only = avail_h < 200.0;
 
     if ui.available_height() >= if compact { 48.0_f32 } else { H_BRAND } {
-        let brand_h = if compact { 16.0 } else { H_BRAND };
+        let brand_h = if compact { 18.0 } else { H_BRAND };
         let (brand_rect, _) =
             ui.allocate_exact_size(egui::vec2(full_w, brand_h), egui::Sense::hover());
         let (badge_w, badge_h) = if compact { (19.0, 16.0) } else { (26.0, 22.0) };
@@ -668,14 +668,14 @@ fn draw_minimize_button(ui: &mut egui::Ui, rect: egui::Rect, id: &str) -> bool {
 }
 
 fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect) {
-    // 52 x 44 RGBA buffer rasterized directly at 2x native aspect ratio for retina clarity
+    // 56 x 48 RGBA buffer rasterized directly with safe margins for retina clarity
     const RAW_LOGO_RGBA: &[u8] = include_bytes!("m-and-bones.rgba");
     let tex_id = egui::Id::new("pirate_sampler_m_bones_logo_tex");
     let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(tex_id));
     let texture = match cached {
         Some(handle) => handle,
         None => {
-            let image = egui::ColorImage::from_rgba_unmultiplied([52, 44], RAW_LOGO_RGBA);
+            let image = egui::ColorImage::from_rgba_unmultiplied([56, 48], RAW_LOGO_RGBA);
             let handle = ui.ctx().load_texture(
                 "pirate_sampler_m_bones_logo",
                 image,
