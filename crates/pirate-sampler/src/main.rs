@@ -21,9 +21,10 @@ fn main() {
         env::set_var("PULSE_SOURCE", "@DEFAULT_MONITOR@");
     }
 
-    // 4. Automatically link system audio monitor to inputs on Linux/PipeWire.
+    // 4. Automatically link the system audio monitor to the inputs and the plugin's outputs to
+    //    the default sink on Linux/PipeWire, so capture *and* playback are audible.
     thread::spawn(|| {
-        routing::auto_connect_system_monitor();
+        routing::auto_connect_standalone();
     });
 
     nih_export_standalone::<PirateSampler>();

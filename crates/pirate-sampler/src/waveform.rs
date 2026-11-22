@@ -4,10 +4,12 @@
 use nih_plug_egui::egui::{self, Color32};
 
 use crate::clips::drag_out_selection;
-use crate::editor::EditorState;
+use crate::editor::{pause_playback_off_lock, toggle_playback, EditorState, LoopSlide};
 use crate::theme;
 
 const EDGE_GRAB_PX: f32 = 8.0;
+/// Right-button travel below this is a click (toggle playback) rather than a pan drag.
+const SEC_CLICK_SLOP_PX: f32 = 4.0;
 
 /// Pixel x for a normalized buffer position inside the visible `view` window.
 fn x_at_t(t: f32, plot_rect: egui::Rect, view: (f32, f32)) -> f32 {
@@ -26,9 +28,6 @@ pub fn draw_waveform_card(
     ui: &mut egui::Ui,
     ed: &mut EditorState,
     card_h: f32,
-    filled_frames: usize,
-    cap_secs: f32,
-    sr: f32,
     is_empty: bool,
     _paused: bool,
 ) {
@@ -41,24 +40,32 @@ pub fn draw_waveform_card(
     let mid = plot_rect.center().y;
     let half_h = (plot_rect.height() * 0.5 - 2.0).max(6.0);
 
-    draw_peaks(&painter, plot_rect, ed, mid, half_h, is_empty);
+    let num_buckets = (plot_rect.width().max(32.0) as usize).clamp(32, 2048);
+    let (view_start, view_end) = ed.view_range;
+    let visible_start = view_start.max(0.0);
+    let visible_end = view_end.min(1.0);
+    let visible_fraction = ((visible_end - visible_start) / (view_end - view_start)).max(0.0);
+    let visible_buckets = ((num_buckets as f32 * visible_fraction).ceil() as usize).max(1);
+    let (peaks, playhead) =
+        waveform_snapshot(ed, num_buckets, visible_buckets, visible_start, visible_end);
+
+    draw_peaks(
+        &painter,
+        plot_rect,
+        ed.view_range,
+        &peaks,
+        is_empty,
+        mid,
+        half_h,
+    );
 
     let hovering_edge = handle_pointer_interaction(ui, &response, plot_rect, ed);
 
     if let Some((a, b)) = ed.selection {
-        draw_selection_overlay(
-            &painter,
-            plot_rect,
-            mid,
-            a,
-            b,
-            hovering_edge,
-            filled_frames,
-            cap_secs,
-            sr,
-            ed.view_range,
-        );
+        draw_selection_overlay(&painter, plot_rect, mid, a, b, hovering_edge, ed.view_range);
     }
+
+    draw_playhead(&painter, plot_rect, ed.view_range, playhead);
 
     if ed.freeze_view {
         draw_state_stamp(&painter, plot_rect, "FROZEN");
@@ -68,43 +75,14 @@ pub fn draw_waveform_card(
 fn draw_peaks(
     painter: &egui::Painter,
     plot_rect: egui::Rect,
-    ed: &mut EditorState,
+    view_range: (f32, f32),
+    peaks: &[(f32, f32)],
+    is_empty: bool,
     mid: f32,
     half_h: f32,
-    is_empty: bool,
 ) {
-    let num_buckets = (plot_rect.width().max(32.0) as usize).clamp(32, 2048);
-    let (view_start, view_end) = ed.view_range;
-    let visible_start = view_start.max(0.0);
-    let visible_end = view_end.min(1.0);
-    let visible_fraction = ((visible_end - visible_start) / (view_end - view_start)).max(0.0);
-    let visible_buckets = ((num_buckets as f32 * visible_fraction).ceil() as usize).max(1);
-    let peaks = if ed.freeze_view {
-        let needs_snap = ed
-            .frozen_peaks
-            .as_ref()
-            .is_none_or(|v| v.len() != num_buckets);
-        if needs_snap {
-            let snap = ed.ring.lock().waveform_peaks(num_buckets);
-            ed.frozen_peaks = Some(snap);
-        }
-        let snap = ed.frozen_peaks.as_ref().unwrap();
-        if snap.is_empty() {
-            Vec::new()
-        } else {
-            (0..visible_buckets)
-                .map(|i| {
-                    let t = visible_start
-                        + (i as f32 + 0.5) / visible_buckets as f32 * (visible_end - visible_start);
-                    snap[((t * snap.len() as f32) as usize).min(snap.len() - 1)]
-                })
-                .collect()
-        }
-    } else {
-        ed.ring
-            .lock()
-            .waveform_peaks_range(visible_buckets, visible_start, visible_end)
-    };
+    let visible_start = view_range.0.max(0.0);
+    let visible_end = view_range.1.min(1.0);
 
     if is_empty || peaks.is_empty() {
         painter.text(
@@ -127,7 +105,7 @@ fn draw_peaks(
 
         for (i, (l, r)) in peaks.iter().enumerate() {
             let t = visible_start + (i as f32 + 0.5) / n * (visible_end - visible_start);
-            let x = x_at_t(t, plot_rect, ed.view_range);
+            let x = x_at_t(t, plot_rect, view_range);
             let raw_amp = ((*l).max(*r)).clamp(0.0, 1.0);
             let norm_amp = if max_peak > 1e-6 {
                 (raw_amp / max_peak).clamp(0.0, 1.0)
@@ -169,6 +147,46 @@ fn draw_peaks(
     }
 }
 
+/// One locked snapshot of the peaks and playhead for this frame.
+///
+/// Both reads share one ring lock, and the guard is dropped before interaction can mutate the
+/// ring, so repainting never competes with an edit.
+fn waveform_snapshot(
+    ed: &mut EditorState,
+    num_buckets: usize,
+    visible_buckets: usize,
+    visible_start: f32,
+    visible_end: f32,
+) -> (Vec<(f32, f32)>, Option<f32>) {
+    let freeze = ed.freeze_view;
+    let mut frozen = ed.frozen_peaks.take();
+    let ring = ed.ring.lock();
+    let peaks = if freeze {
+        let needs_snap = frozen.as_ref().is_none_or(|v| v.len() != num_buckets);
+        if needs_snap {
+            frozen = Some(ring.waveform_peaks(num_buckets));
+        }
+        let snap = frozen.as_ref().expect("snapshot was just populated");
+        if snap.is_empty() {
+            Vec::new()
+        } else {
+            (0..visible_buckets)
+                .map(|i| {
+                    let t = visible_start
+                        + (i as f32 + 0.5) / visible_buckets as f32 * (visible_end - visible_start);
+                    snap[((t * snap.len() as f32) as usize).min(snap.len() - 1)]
+                })
+                .collect()
+        }
+    } else {
+        ring.waveform_peaks_range(visible_buckets, visible_start, visible_end)
+    };
+    let playhead = ring.playhead_fraction();
+    drop(ring);
+    ed.frozen_peaks = frozen;
+    (peaks, playhead)
+}
+
 fn handle_pointer_interaction(
     ui: &mut egui::Ui,
     response: &egui::Response,
@@ -189,6 +207,18 @@ fn handle_pointer_interaction(
     let primary_released = input.pointer.button_released(egui::PointerButton::Primary);
     let secondary_pressed = input.pointer.button_pressed(egui::PointerButton::Secondary);
     let secondary_down = input.pointer.button_down(egui::PointerButton::Secondary);
+    let secondary_released = input
+        .pointer
+        .button_released(egui::PointerButton::Secondary);
+    // While a selection loops, a drag outside the brace scrubs the captured audio under the fixed
+    // loop instead of drawing a new selection.
+    let (looping, filled_frames) = {
+        let ring = ed.ring.lock();
+        (
+            ed.selection.is_some() && ring.is_looping(),
+            ring.filled_frames(),
+        )
+    };
 
     let mut hovering_edge = false;
     let mut hovering_inside_sel = false;
@@ -206,7 +236,7 @@ fn handle_pointer_interaction(
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if hovering_edge {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-    } else if hovering_inside_sel {
+    } else if hovering_inside_sel || (looping && pointer_in_plot.is_some()) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     } else if pointer_in_plot.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -279,6 +309,9 @@ fn handle_pointer_interaction(
             }) {
                 let t = t_at_x(pos.x, plot_rect, view).clamp(0.0, 1.0);
                 ed.selection_body_press = false;
+                ed.edge_drag = false;
+                // Never inherit a scrub from a gesture whose release we did not see.
+                ed.loop_slide = None;
                 if let Some((a, b)) = ed.selection {
                     let (start_n, end_n) = (a.min(b), a.max(b));
                     let x0 = x_at_t(start_n, plot_rect, view);
@@ -286,14 +319,27 @@ fn handle_pointer_interaction(
                     if (pos.x - x0).abs() <= EDGE_GRAB_PX {
                         ed.drag_anchor = Some(end_n);
                         ed.selection = Some((t, end_n));
+                        ed.edge_drag = true;
                     } else if (pos.x - x1).abs() <= EDGE_GRAB_PX {
                         ed.drag_anchor = Some(start_n);
                         ed.selection = Some((start_n, t));
+                        ed.edge_drag = true;
                     } else if pos.x > x0 && pos.x < x1 {
-                        // Pressed inside the selection: dragging from here drags the clip out.
+                        // A press inside the brace starts a clip drag for the DAW. A left drag
+                        // never draws a new selection on top of an existing one.
                         ed.drag_anchor = None;
                         ed.selection_body_press = true;
+                    } else if looping {
+                        // Looping: dragging outside the brace moves the captured audio itself, so
+                        // new material slides into the loop without stopping or moving the brace.
+                        ed.drag_anchor = None;
+                        ed.loop_slide = Some(LoopSlide {
+                            anchor: t,
+                            applied: 0,
+                        });
                     } else {
+                        // A press outside the brace starts a fresh selection and discards the
+                        // old one; `Esc` is the way to clear it and start over.
                         ed.drag_anchor = Some(t);
                         ed.selection = Some((t, t));
                     }
@@ -305,8 +351,15 @@ fn handle_pointer_interaction(
         } else if primary_down {
             if let Some(pos) = pointer {
                 let t = t_at_x(pos.x, plot_rect, view).clamp(0.0, 1.0);
-                if let Some(anchor) = ed.drag_anchor {
+                if ed.loop_slide.is_some() {
+                    apply_loop_slide(ed, t, filled_frames);
+                } else if let Some(anchor) = ed.drag_anchor {
                     ed.selection = Some((anchor, t));
+                    // A running loop follows the brace live, so widening the selection auditions
+                    // the wider range without stopping and restarting.
+                    if ed.edge_drag && looping {
+                        ed.ring.lock().resize_loop(anchor.min(t), anchor.max(t));
+                    }
                 } else if ed.selection_body_press && input.pointer.is_decidedly_dragging() {
                     ed.status = drag_out_selection(ed);
                     ed.selection_body_press = false;
@@ -315,20 +368,64 @@ fn handle_pointer_interaction(
         }
     }
 
+    // Right button does double duty: a drag pans the view (handled above), while a press and
+    // release that never travelled far enough to pan toggles selection playback.
+    if secondary_pressed {
+        if let Some(pos) = press_pos.or(pointer) {
+            if plot_rect.contains(pos) {
+                ed.sec_press = Some((pos, false));
+            }
+        }
+    }
+    if let (Some((origin, moved)), Some(pos)) = (ed.sec_press, pointer) {
+        ed.sec_press = Some((origin, moved || (pos - origin).length() > SEC_CLICK_SLOP_PX));
+    }
+    if secondary_released {
+        if let Some((origin, moved)) = ed.sec_press.take() {
+            if !moved && plot_rect.contains(origin) {
+                ed.status = toggle_playback(ed);
+            }
+        }
+    }
+
     // Finish the left-button gesture: drop click-without-drag selections and clear the anchor.
     if primary_released {
         ed.selection_body_press = false;
+        ed.edge_drag = false;
+        ed.loop_slide = None;
         if ed.drag_anchor.take().is_some() {
             if let Some((a, b)) = ed.selection {
                 let span = (view.1 - view.0).max(f32::EPSILON);
                 if (b - a).abs() / span * plot_rect.width() < 2.0 {
                     ed.selection = None;
+                    // A vanished brace must not leave a loop playing with nothing to show for it.
+                    pause_playback_off_lock(ed);
                 }
             }
         }
     }
 
     hovering_edge
+}
+
+/// Rotate the captured audio so it follows the pointer under the fixed loop.
+///
+/// The brace and the playhead stay put; the audio moves by `pointer_t - anchor` frames, wrapping
+/// inside the filled capture, and the loop keeps auditioning whatever is underneath it.
+fn apply_loop_slide(ed: &mut EditorState, pointer_t: f32, filled: usize) {
+    let Some(mut slide) = ed.loop_slide else {
+        return;
+    };
+    if filled == 0 {
+        return;
+    }
+    let desired = ((pointer_t - slide.anchor) * filled as f32).round() as i64;
+    let delta = desired - slide.applied;
+    if delta == 0 {
+        return;
+    }
+    slide.applied += ed.ring.lock().shift_content(delta);
+    ed.loop_slide = Some(slide);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,9 +436,6 @@ fn draw_selection_overlay(
     a: f32,
     b: f32,
     active_edge: bool,
-    filled_frames: usize,
-    cap_secs: f32,
-    sr: f32,
     view_range: (f32, f32),
 ) {
     let start_n = a.min(b);
@@ -399,51 +493,40 @@ fn draw_selection_overlay(
             egui::Stroke::new(1.0_f32, theme::BG),
         );
     }
+}
 
-    let start_frame = (start_n * filled_frames as f32).floor() as usize;
-    let end_frame = ((end_n * filled_frames as f32).ceil() as usize).min(filled_frames);
-    let sel_frames = end_frame.saturating_sub(start_frame);
-    let sel_secs = if filled_frames > 0 {
-        sel_frames as f32 / sr.max(1.0)
-    } else {
-        (end_n - start_n) * cap_secs
+fn draw_playhead(
+    painter: &egui::Painter,
+    plot_rect: egui::Rect,
+    view_range: (f32, f32),
+    playhead: Option<f32>,
+) {
+    let Some(t) = playhead else {
+        return;
     };
-    let label_str = format_mm_ss_mmm(sel_secs);
-    let galley = painter.layout_no_wrap(label_str, theme::font_small(), theme::TEXT);
-    let pill_w = galley.size().x + 14.0;
-    let pill_h = 20.0_f32;
-    let center_x = ((x0 + x1) * 0.5).clamp(
-        plot_rect.left() + pill_w * 0.5 + 6.0,
-        plot_rect.right() - pill_w * 0.5 - 6.0,
+    let (view_start, view_end) = view_range;
+    if t < view_start || t > view_end {
+        return;
+    }
+    let x = x_at_t(t, plot_rect, view_range);
+    painter.line_segment(
+        [
+            egui::pos2(x, plot_rect.top() + 1.0),
+            egui::pos2(x, plot_rect.bottom() - 1.0),
+        ],
+        egui::Stroke::new(1.5_f32, theme::ACCENT_HOVER),
     );
-    let pill_y = if plot_rect.height() < 40.0 {
-        mid
-    } else {
-        plot_rect.top() + 15.0
-    };
-    let pill_rect = egui::Rect::from_center_size(
-        egui::pos2(center_x, pill_y),
-        egui::vec2(pill_w, pill_h.min(plot_rect.height() - 2.0)),
-    );
-    painter.rect_filled(
-        pill_rect,
-        egui::CornerRadius::same(theme::CONTROL_RADIUS),
-        theme::BG,
-    );
-    painter.rect_stroke(
-        pill_rect,
-        egui::CornerRadius::same(theme::CONTROL_RADIUS),
-        egui::Stroke::new(1.0_f32, theme::TEXT),
-        egui::StrokeKind::Inside,
-    );
-    painter.galley(
-        egui::pos2(
-            pill_rect.center().x - galley.size().x * 0.5,
-            pill_rect.center().y - galley.size().y * 0.5,
-        ),
-        galley,
-        theme::TEXT,
-    );
+    let tri_w = 4.0;
+    let tri_h = 6.0_f32.min(plot_rect.height() * 0.4);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x - tri_w, plot_rect.top() + 1.0),
+            egui::pos2(x + tri_w, plot_rect.top() + 1.0),
+            egui::pos2(x, plot_rect.top() + 1.0 + tri_h),
+        ],
+        theme::ACCENT_HOVER,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn draw_state_stamp(painter: &egui::Painter, plot_rect: egui::Rect, stamp_text: &str) {
@@ -473,14 +556,6 @@ fn draw_state_stamp(painter: &egui::Painter, plot_rect: egui::Rect, stamp_text: 
         galley,
         theme::TEXT,
     );
-}
-
-pub fn format_mm_ss_mmm(seconds: f32) -> String {
-    let total_ms = (seconds.max(0.0) * 1000.0).round() as u64;
-    let mins = total_ms / 60_000;
-    let secs = (total_ms % 60_000) / 1000;
-    let millis = total_ms % 1000;
-    format!("{:02}:{:02}.{:03}", mins, secs, millis)
 }
 
 #[cfg(test)]
@@ -525,18 +600,17 @@ mod tests {
             let ed = &mut self.ed;
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    draw_waveform_card(
-                        ui,
-                        ed,
-                        ui.available_height(),
-                        48_000,
-                        1.0,
-                        48_000.0,
-                        false,
-                        false,
-                    );
+                    draw_waveform_card(ui, ed, ui.available_height(), false, false);
                 });
             });
+        }
+
+        /// Record `frames` frames so playback has audio to read.
+        fn fill(&mut self, frames: usize) {
+            let mut ring = self.ed.ring.lock();
+            for i in 0..frames {
+                ring.write_frame(i as f32, -(i as f32));
+            }
         }
 
         fn hover(&mut self, pos: egui::Pos2) {
@@ -562,13 +636,6 @@ mod tests {
             }
             self.button(to, button, false);
         }
-    }
-
-    #[test]
-    fn formats_duration_badge_correctly() {
-        assert_eq!(format_mm_ss_mmm(0.0), "00:00.000");
-        assert_eq!(format_mm_ss_mmm(1.87), "00:01.870");
-        assert_eq!(format_mm_ss_mmm(65.125), "01:05.125");
     }
 
     #[test]
@@ -677,5 +744,191 @@ mod tests {
         );
         assert_eq!(h.ed.view_range, (0.0, 1.0), "selecting must not pan");
         assert!(!h.ed.selection_body_press);
+    }
+
+    #[test]
+    fn press_inside_the_brace_arms_a_clip_drag_instead_of_a_new_selection() {
+        let mut h = Harness::new((0.0, 1.0), Some((0.25, 0.5)));
+        h.fill(48_000);
+        assert!(h.ed.ring.lock().loop_range(0.25, 0.5, 0.25));
+
+        // Well inside the brace, away from both edge handles.
+        let inside = egui::pos2(250.0, 150.0);
+        h.hover(inside);
+        h.button(inside, egui::PointerButton::Primary, true);
+
+        assert_eq!(
+            h.ed.selection,
+            Some((0.25, 0.5)),
+            "a press inside the brace must not draw a new selection"
+        );
+        assert!(
+            h.ed.selection_body_press,
+            "a press inside the brace must arm the clip drag-out"
+        );
+        assert_eq!(h.ed.drag_anchor, None, "no new selection anchor");
+        assert_eq!(h.ed.loop_slide, None, "inside the brace must not scrub");
+        assert!(h.ed.ring.lock().is_playing(), "the loop must keep running");
+
+        h.button(inside, egui::PointerButton::Primary, false);
+        assert!(!h.ed.selection_body_press, "release must disarm the drag");
+    }
+
+    #[test]
+    fn drag_outside_the_loop_moves_the_audio_under_it() {
+        let mut h = Harness::new((0.0, 1.0), Some((0.25, 0.5)));
+        h.fill(48_000);
+        assert!(h.ed.ring.lock().loop_range(0.25, 0.5, 0.25));
+
+        h.drag(
+            egui::pos2(480.0, 150.0),
+            egui::pos2(420.0, 150.0),
+            egui::PointerButton::Primary,
+        );
+
+        assert_eq!(
+            h.ed.selection,
+            Some((0.25, 0.5)),
+            "scrubbing must not move the loop brace"
+        );
+        let shift = h.ed.ring.lock().shift_frames();
+        assert!(
+            (-6_000..=-4_000).contains(&shift),
+            "dragging left must move earlier audio under the loop, got {shift}"
+        );
+        assert!(
+            h.ed.ring.lock().is_playing(),
+            "scrubbing must not stop the loop"
+        );
+        assert_eq!(h.ed.loop_slide, None, "release must end the scrub");
+        assert!(
+            h.ed.ring.lock().read_logical(12_000) != Some((12_000.0, -12_000.0)),
+            "the loop must now read different audio"
+        );
+    }
+
+    #[test]
+    fn dragging_the_loop_edge_resizes_the_running_loop() {
+        let mut h = Harness::new((0.0, 1.0), Some((0.25, 0.5)));
+        h.fill(48_000);
+        assert!(h.ed.ring.lock().loop_range(0.25, 0.5, 0.25));
+
+        // The right brace sits at x ~= 300; drag it right to widen the loop.
+        h.drag(
+            egui::pos2(300.0, 150.0),
+            egui::pos2(373.0, 150.0),
+            egui::PointerButton::Primary,
+        );
+
+        let (start, end) = h.ed.selection.expect("the brace is still selected");
+        assert!(
+            (start - 0.25).abs() < 0.01,
+            "the far edge must stay put, got {start}"
+        );
+        assert!(
+            (0.61..0.64).contains(&end),
+            "the dragged edge must follow the pointer, got {end}"
+        );
+        assert!(
+            h.ed.ring.lock().is_playing(),
+            "resizing must not stop the loop"
+        );
+        assert!(!h.ed.edge_drag, "release must end the resize");
+
+        // The wider window must reach past the old end (0.5 * 48_000 = 24_000 frames).
+        let mut ring = h.ed.ring.lock();
+        let mut max_seen = f32::MIN;
+        for _ in 0..20_000 {
+            if let Some((v, _)) = ring.next_playback_frame() {
+                max_seen = max_seen.max(v);
+            }
+        }
+        assert!(
+            max_seen > 28_000.0,
+            "the widened loop must play past the old end, saw {max_seen}"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_playing_loop_stops_playback() {
+        let mut h = Harness::new((0.0, 1.0), Some((0.25, 0.5)));
+        h.fill(48_000);
+        assert!(h.ed.ring.lock().loop_range(0.25, 0.5, 0.25));
+
+        // The right brace is at x ~= 300; drag it onto the left brace at x ~= 154.
+        h.drag(
+            egui::pos2(300.0, 150.0),
+            egui::pos2(155.5, 150.0),
+            egui::PointerButton::Primary,
+        );
+
+        assert_eq!(h.ed.selection, None, "a sub-2px brace is discarded");
+        assert!(
+            !h.ed.ring.lock().is_playing(),
+            "a discarded brace must not leave audio looping"
+        );
+    }
+
+    #[test]
+    fn right_click_toggles_playback_without_selection() {
+        let mut h = Harness::new((0.0, 1.0), None);
+        h.fill(48_000);
+        h.hover(START);
+        h.button(START, egui::PointerButton::Secondary, true);
+        h.button(START, egui::PointerButton::Secondary, false);
+
+        assert!(
+            h.ed.ring.lock().is_playing(),
+            "a right click must start playback"
+        );
+        h.button(START, egui::PointerButton::Secondary, true);
+        h.button(START, egui::PointerButton::Secondary, false);
+        assert!(
+            !h.ed.ring.lock().is_playing(),
+            "second click stops playback"
+        );
+        assert_eq!(h.ed.view_range, (0.0, 1.0), "a right click must not pan");
+    }
+
+    #[test]
+    fn right_click_loops_the_selection_until_clicked_again() {
+        let mut h = Harness::new((0.0, 1.0), Some((0.0, 0.8)));
+        h.fill(48_000);
+        h.hover(START);
+        h.button(START, egui::PointerButton::Secondary, true);
+        h.button(START, egui::PointerButton::Secondary, false);
+
+        {
+            let mut ring = h.ed.ring.lock();
+            assert!(ring.is_playing(), "a right click must start playback");
+            assert_eq!(ring.playhead_fraction(), Some(0.0));
+            for _ in 0..48_000 {
+                assert!(ring.next_playback_frame().is_some(), "selection must loop");
+            }
+            assert!(ring.is_playing());
+        }
+        h.button(START, egui::PointerButton::Secondary, true);
+        h.button(START, egui::PointerButton::Secondary, false);
+        assert!(
+            !h.ed.ring.lock().is_playing(),
+            "second click stops the loop"
+        );
+    }
+
+    #[test]
+    fn right_drag_pans_without_starting_playback() {
+        let mut h = Harness::new((0.25, 0.5), None);
+        h.fill(48_000);
+        h.drag(
+            START,
+            START + egui::vec2(60.0, 0.0),
+            egui::PointerButton::Secondary,
+        );
+
+        assert!(
+            !h.ed.ring.lock().is_playing(),
+            "panning must not start playback"
+        );
+        assert!(h.ed.view_range.0 < 0.25, "right-drag must still pan");
     }
 }

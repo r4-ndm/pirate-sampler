@@ -3,7 +3,7 @@ name = "pirate-sampler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pirate Sampler — rolling ring-buffer capture plugin (VST3 + standalone)"
+description = "Pirate Sampler — standalone-first rolling ring-buffer sampler (VST3 export kept dormant)"
 
 [lib]
 crate-type = ["cdylib", "lib"]

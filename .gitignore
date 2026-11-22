@@ -2,7 +2,6 @@
 **/*.rs.bk
 .DS_Store
 *.wav
-!testdata/**/*.wav
 .idea/
 .vscode/
 

@@ -19,6 +19,19 @@ use crate::params::PirateSamplerParams;
 /// Shared GUI state.
 pub type SharedEditor = Arc<Mutex<editor::EditorState>>;
 
+/// True when running as the standalone binary, which is the supported target.
+///
+/// `main.rs` sets `PIRATE_STANDALONE=1` before the plugin is created. The VST3 export below is kept
+/// deliberately, but it must not claim the standalone-only behaviour: desktop routing, frameless
+/// window chrome, and the pass-through feedback mute.
+///
+/// Cached because the GUI asks on every frame and the answer cannot change while `main.rs` is
+/// still setting it up.
+pub fn is_standalone() -> bool {
+    static STANDALONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STANDALONE.get_or_init(|| std::env::var_os("PIRATE_STANDALONE").is_some())
+}
+
 pub struct PirateSampler {
     params: Arc<PirateSamplerParams>,
     ring: Arc<Mutex<RingBuffer>>,
@@ -37,7 +50,7 @@ impl Default for PirateSampler {
             BufferDuration::default(),
         )));
         let gui = Arc::new(Mutex::new(editor::EditorState::new(Arc::clone(&ring))));
-        let is_standalone = std::env::var_os("PIRATE_STANDALONE").is_some();
+        let is_standalone = is_standalone();
         Self {
             params,
             ring,
@@ -134,29 +147,51 @@ impl Plugin for PirateSampler {
                 let Some(l) = iter.next() else {
                     break;
                 };
+                // Advance the parameter smoother once per frame, then apply its current value.
+                let gain = util::db_to_gain(self.params.playback_gain_db.smoothed.next());
                 let Some(r) = iter.next() else {
-                    // Mono-like: duplicate
                     let sample = *l;
-                    if !bypass {
-                        ring.write_frame(sample, sample);
-                    }
+                    *l =
+                        render_frame(&mut ring, sample, sample, bypass, gain, self.is_standalone).0;
                     continue;
                 };
-
-                let left = *l;
-                let right = *r;
-                // Transparent pass-through: outputs already hold inputs in-place.
-                if !bypass {
-                    ring.write_frame(left, right);
-                }
-                if self.is_standalone {
-                    *l = 0.0;
-                    *r = 0.0;
-                }
+                let (left, right) =
+                    render_frame(&mut ring, *l, *r, bypass, gain, self.is_standalone);
+                *l = left;
+                *r = right;
             }
         }
 
         ProcessStatus::Normal
+    }
+}
+
+/// Record or play one stereo frame, returning the output while preserving pass-through.
+///
+/// Playback freezes recording, and the standalone mutes unplayed output so a monitored capture
+/// cannot feed back into itself. Mono host layouts pass the same sample in both channels.
+fn render_frame(
+    ring: &mut RingBuffer,
+    left: f32,
+    right: f32,
+    bypass: bool,
+    gain: f32,
+    standalone: bool,
+) -> (f32, f32) {
+    let playback = if bypass {
+        None
+    } else {
+        ring.next_playback_frame()
+    };
+    // Recording and playback never happen in the same frame.
+    if !bypass && !ring.is_playing() {
+        ring.write_frame(left, right);
+    }
+    match playback {
+        Some((played_l, played_r)) => (played_l * gain, played_r * gain),
+        None if standalone => (0.0, 0.0),
+        // Transparent pass-through: outputs already hold the inputs.
+        None => (left, right),
     }
 }
 
@@ -173,6 +208,11 @@ impl ClapPlugin for PirateSampler {
     ];
 }
 
+/// Dormant VST3 export, kept on purpose so the plugin can be loaded in a host later.
+///
+/// The standalone binary is the supported product (see `README.md`). In a host there is no desktop
+/// routing and [`chrome`] stays inert, and host state/automation is not wired up, so don't build
+/// host-specific features without a concrete need.
 impl Vst3Plugin for PirateSampler {
     const VST3_CLASS_ID: [u8; 16] = *b"PirateSamplerV3!";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
@@ -197,6 +237,44 @@ mod tests {
         let p = PirateSamplerParams::default();
         let secs = p.buffer_seconds.default_plain_value();
         assert!((30.0..=600.0).contains(&secs));
+    }
+
+    #[test]
+    fn mono_and_stereo_frames_record_the_same_capture() {
+        let mut mono = RingBuffer::with_capacity(48_000.0, 4);
+        let mut stereo = RingBuffer::with_capacity(48_000.0, 4);
+
+        let mono_out = render_frame(&mut mono, 0.5, 0.5, false, 1.0, true).0;
+        let (stereo_l, stereo_r) = render_frame(&mut stereo, 0.5, 0.5, false, 1.0, true);
+
+        assert_eq!(mono_out, 0.0, "standalone mutes unplayed output");
+        assert_eq!(stereo_l, 0.0);
+        assert_eq!(stereo_r, 0.0);
+        assert_eq!(mono.read_logical(0), Some((0.5, 0.5)));
+        assert_eq!(mono.read_logical(0), stereo.read_logical(0));
+    }
+
+    #[test]
+    fn rendered_playback_applies_gain_and_vst3_passes_through() {
+        let mut ring = RingBuffer::with_capacity(48_000.0, 4);
+        for i in 0..4 {
+            ring.write_frame(i as f32, (i * 10) as f32);
+        }
+        assert!(ring.play_range(0.0, 1.0));
+
+        let (left, right) = render_frame(&mut ring, 9.0, 9.0, false, 0.5, false);
+        assert_eq!((left, right), (0.0, 0.0));
+        assert!(ring.is_playing());
+
+        let (left, right) = render_frame(
+            &mut RingBuffer::with_capacity(48_000.0, 2),
+            3.0,
+            4.0,
+            true,
+            0.5,
+            false,
+        );
+        assert_eq!((left, right), (3.0, 4.0), "bypass stays transparent");
     }
 
     #[test]

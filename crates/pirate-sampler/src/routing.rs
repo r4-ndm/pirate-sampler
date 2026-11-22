@@ -1,8 +1,9 @@
 //! PipeWire / JACK input routing module for standalone mode.
 //!
 //! Deep module that encapsulates all OS-level PipeWire (`pw-link`) and PulseAudio (`pactl`)
-//! topology queries, graph cycle prevention, and dynamic input switching between
-//! System Audio (desktop monitor) and Microphone.
+//! topology queries, graph cycle prevention, dynamic input switching between
+//! System Audio (desktop monitor) and Microphone, and playback monitoring of the plugin's
+//! own outputs into the default sink.
 
 use std::process::Command;
 
@@ -15,9 +16,12 @@ pub enum AudioInputSource {
 
 const PORT_IN_L: &str = "pirate_sampler:input_1";
 const PORT_IN_R: &str = "pirate_sampler:input_2";
+const PORT_OUT_L: &str = "pirate_sampler:output_1";
+const PORT_OUT_R: &str = "pirate_sampler:output_2";
 
 /// Dynamically switches standalone PipeWire/JACK audio inputs to `source`.
-/// Updates `active_links` with the newly created port connections and returns a human-readable status message.
+/// Updates `active_links` with the newly created capture connections and returns a human-readable
+/// status message.
 pub fn switch_input_source(
     active_links: &mut Vec<(String, String)>,
     source: AudioInputSource,
@@ -40,15 +44,23 @@ pub fn switch_input_source(
         return "Failed to list audio sources".to_string();
     };
 
-    match source {
+    let status = match source {
         AudioInputSource::SystemAudio => connect_system_monitor(&outputs, active_links),
         AudioInputSource::Microphone => connect_microphone(&outputs, active_links),
-    }
+    };
+
+    // Output monitoring is independent of the capture source, and the link sweep above dropped
+    // it, so it has to be re-established on every switch.
+    let monitor_status = connect_default_sink_outputs();
+    eprintln!("[Pirate Sampler] {monitor_status}");
+
+    status
 }
 
-/// Polls for the standalone JACK client to register (up to 5 seconds) and connects
-/// the system desktop audio monitor passively. Used at standalone startup.
-pub fn auto_connect_system_monitor() {
+/// Polls for the standalone JACK client to register (up to 5 seconds), then connects both the
+/// system desktop audio monitor (`input_1/2`) and the plugin's outputs to the default sink
+/// (`output_1/2`). Used at standalone startup.
+pub fn auto_connect_standalone() {
     for _ in 0..25 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let Some(inputs) = run_stdout("pw-link", &["-i"]) else {
@@ -119,8 +131,36 @@ fn connect_microphone(outputs: &str, active_links: &mut Vec<(String, String)>) -
     }
 }
 
-fn link_passive(src: &str, dst: &str, active_links: &mut Vec<(String, String)>) {
+/// Connects the standalone's own outputs to the default sink's playback ports so auditioning a
+/// selection (and the recorded buffer in general) is audible. Without this the client's output
+/// ports are published but unlinked, leaving playback silent.
+fn connect_default_sink_outputs() -> String {
+    let Some(inputs) = run_stdout("pw-link", &["-i"]) else {
+        return "Standalone PipeWire/JACK required".to_string();
+    };
+    let default_sink = run_stdout("pactl", &["get-default-sink"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let (out_l, out_r) = find_sink_ports(&inputs, &default_sink);
+    match (out_l, out_r) {
+        (Some(l), Some(r)) => {
+            link(PORT_OUT_L, &l);
+            link(PORT_OUT_R, &r);
+            "Monitoring playback".to_string()
+        }
+        _ => "Playback sink not found".to_string(),
+    }
+}
+
+/// Connect two ports without tracking them: the startup connection has no later clean-up pass,
+/// and `disconnect_all_pirate_links` already sweeps every `pirate_sampler:` link on a switch.
+fn link(src: &str, dst: &str) {
     let _ = Command::new("pw-link").args(["-P", src, dst]).output();
+}
+
+fn link_passive(src: &str, dst: &str, active_links: &mut Vec<(String, String)>) {
+    link(src, dst);
     active_links.push((src.to_string(), dst.to_string()));
 }
 
@@ -155,6 +195,36 @@ pub fn find_monitor_ports(outputs: &str, default_sink: &str) -> (Option<String>,
         }
     }
     (mon_l, mon_r)
+}
+
+/// Pure port-resolution helper: finds the default sink's left and right playback ports.
+///
+/// A default-sink match always wins; the generic `:playback_FL/FR` fallback is only used when no
+/// default match exists, so a later non-default port can never overwrite the default sink.
+pub fn find_sink_ports(inputs: &str, default_sink: &str) -> (Option<String>, Option<String>) {
+    let mut out_l = None;
+    let mut out_r = None;
+    for line in inputs.lines() {
+        let trimmed = line.trim();
+        let is_default_sink = !default_sink.is_empty()
+            && trimmed.starts_with(default_sink)
+            && trimmed.contains("playback");
+        let is_default_fl = is_default_sink && trimmed.ends_with("playback_FL");
+        let fallback_fl = out_l.is_none()
+            && (trimmed.ends_with("analog-stereo:playback_FL")
+                || trimmed.ends_with(":playback_FL"));
+        if is_default_fl || fallback_fl {
+            out_l = Some(trimmed.to_string());
+        }
+        let is_default_fr = is_default_sink && trimmed.ends_with("playback_FR");
+        let fallback_fr = out_r.is_none()
+            && (trimmed.ends_with("analog-stereo:playback_FR")
+                || trimmed.ends_with(":playback_FR"));
+        if is_default_fr || fallback_fr {
+            out_r = Some(trimmed.to_string());
+        }
+    }
+    (out_l, out_r)
 }
 
 /// Pure port-resolution helper: finds ordered microphone capture ports, prioritizing `default_mic`.
@@ -192,6 +262,36 @@ mod tests {
             r.as_deref(),
             Some("alsa_output.pci-0000_07_00.4.analog-stereo:monitor_FR")
         );
+    }
+
+    #[test]
+    fn resolves_default_sink_playback_ports() {
+        let sample = "syntropia_mic:playback_FL\nsyntropia_mic:playback_FR\nalsa_output.pci-0000_07_00.4.analog-stereo:playback_FL\nalsa_output.pci-0000_07_00.4.analog-stereo:playback_FR\n";
+        let (l, r) = find_sink_ports(sample, "alsa_output.pci-0000_07_00.4.analog-stereo");
+        assert_eq!(
+            l.as_deref(),
+            Some("alsa_output.pci-0000_07_00.4.analog-stereo:playback_FL")
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("alsa_output.pci-0000_07_00.4.analog-stereo:playback_FR")
+        );
+    }
+
+    #[test]
+    fn default_sink_ports_win_over_an_earlier_fallback() {
+        let sample = "other:playback_FL\nother:playback_FR\ndefault.analog-stereo:playback_FL\ndefault.analog-stereo:playback_FR\n";
+        let (l, r) = find_sink_ports(sample, "default.analog-stereo");
+        assert_eq!(l.as_deref(), Some("default.analog-stereo:playback_FL"));
+        assert_eq!(r.as_deref(), Some("default.analog-stereo:playback_FR"));
+    }
+
+    #[test]
+    fn a_later_fallback_does_not_overwrite_the_default_sink() {
+        let sample = "default.analog-stereo:playback_FL\ndefault.analog-stereo:playback_FR\nother.analog-stereo:playback_FL\nother.analog-stereo:playback_FR\n";
+        let (l, r) = find_sink_ports(sample, "default.analog-stereo");
+        assert_eq!(l.as_deref(), Some("default.analog-stereo:playback_FL"));
+        assert_eq!(r.as_deref(), Some("default.analog-stereo:playback_FR"));
     }
 
     #[test]

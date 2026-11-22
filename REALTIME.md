@@ -12,8 +12,10 @@
 ## Current trade-off
 
 v1 uses `parking_lot::Mutex` around the ring so the UI can snapshot/export.
-Locks are kept short; the audio thread should rarely contend. A later revision can
-move to a lock-free ring + `triple_buffer` peaks publish.
+Locks are kept short; the audio thread should rarely contend. A scrub bake rotates up to the
+whole capture on the GUI thread without the ring lock: the audio thread records into a small
+parking ring for the duration of the bake, and those frames are appended afterwards. A later
+revision can move to a lock-free ring + `triple_buffer` peaks publish.
 
 ## Verification
 

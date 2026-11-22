@@ -14,8 +14,11 @@
 //! trusted input event (which is also why it could not be verified with
 //! synthetic input), whereas a self-driven move behaves the same to the user.
 //!
-//! Every entry point is a no-op when the window id is unknown (plugin builds or
-//! a non-X11 platform), so the GUI never depends on this module succeeding.
+//! This module is standalone-only: `attach` returns early unless [`crate::is_standalone()`], which
+//! leaves the chrome store empty and every other entry point inert. Inside a host the window id we
+//! are handed belongs to the DAW, and taking it over would strip the host's decorations and move
+//! its window. Every entry point is also a no-op on a non-X11 platform, so the GUI never depends on
+//! this module succeeding.
 
 #[cfg(target_os = "linux")]
 pub use imp::{
@@ -110,6 +113,10 @@ mod imp {
     /// Strip the window-manager decorations and remember the connection.
     /// Safe to call every frame: it returns immediately once this window is attached.
     pub fn attach(window: u32, width: u32, height: u32) {
+        // Only the standalone owns the window it draws into.
+        if !crate::is_standalone() {
+            return;
+        }
         if let Ok(guard) = CHROME.lock() {
             if let Some(chrome) = guard.as_ref() {
                 if chrome.window == window {

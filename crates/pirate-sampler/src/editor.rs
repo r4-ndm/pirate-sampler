@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use pirate_sampler_dsp::{BufferDuration, RingBuffer};
 
 use crate::clips::{copy_selection_to_clipboard, export_selection, open_clips_folder};
-use crate::params::PirateSamplerParams;
+use crate::params::{PirateSamplerParams, PLAYBACK_GAIN_MAX_DB, PLAYBACK_GAIN_MIN_DB};
 use crate::routing::{switch_input_source, AudioInputSource};
 use crate::theme;
 use crate::waveform::draw_waveform_card;
@@ -30,6 +30,16 @@ pub const BOTTOM_MARGIN: i8 = 10;
 pub const HORIZONTAL_MARGINS: f32 = (LEFT_MARGIN as f32) + (RIGHT_GAP as f32);
 pub const VERTICAL_MARGINS: f32 = (TOP_MARGIN as f32) + (BOTTOM_MARGIN as f32);
 pub const WAVEFORM_H: f32 = WINDOW_H - VERTICAL_MARGINS;
+
+/// Compact playback-gain knob diameter, shared by both side-panel layouts.
+const GAIN_KNOB_SIZE: f32 = 26.0;
+const GAIN_KNOB_RADIUS: f32 = GAIN_KNOB_SIZE * 0.5;
+/// Right-edge inset used by the buffer row's gain knob.
+const GAIN_KNOB_INSET: f32 = 16.0;
+/// Width reserved on the buffer row for the gain knob beside the slider.
+const BUFFER_GAIN_RESERVE: f32 = 48.0;
+/// Audio recorded while a scrub bake runs is parked in a ring this long.
+const SCRUB_PARKING_SECONDS: f32 = 2.0;
 
 // Side-panel block heights for deterministic overflow calculation
 const H_BRAND: f32 = 24.0;
@@ -54,18 +64,36 @@ pub const FULL_STACK_NEEDED_H: f32 = H_BRAND
 pub const TIER1_STACK_NEEDED_H: f32 =
     H_BRAND + H_SOURCE_TOGGLE + H_BUFFER + H_EXPORT + H_MORE_BTN + H_METER + 5.0 * SECTION_GAP;
 
+/// A left drag outside a playing loop that scrubs the captured audio under the fixed loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoopSlide {
+    /// Pointer position (normalized buffer time) where the drag started.
+    pub anchor: f32,
+    /// Frames of rotation already applied by this drag.
+    pub applied: i64,
+}
+
 pub struct EditorState {
     pub ring: Arc<Mutex<RingBuffer>>,
+    /// Small stand-in ring used while a scrub bake runs outside the shared lock.
+    spare_ring: Option<RingBuffer>,
     /// Selection as normalized 0..1 over the filled buffer (start, end).
     pub selection: Option<(f32, f32)>,
     pub drag_anchor: Option<f32>,
     /// A left press landed inside the selection: a drag from there drags the clip out.
     pub selection_body_press: bool,
+    /// A left press landed on a selection edge: the drag resizes the selection, and a running
+    /// loop follows the new brace live.
+    pub edge_drag: bool,
+    /// Set while a drag outside the brace is scrubbing the audio under the loop.
+    pub loop_slide: Option<LoopSlide>,
     /// Waveform view range in normalized buffer coordinates; may extend beyond 0.0..=1.0.
     pub view_range: (f32, f32),
     pub is_panning: bool,
     pub pan_start_pos: Option<f32>,
     pub pan_start_range: (f32, f32),
+    /// Right-button press origin and whether it has moved far enough to count as a pan.
+    pub sec_press: Option<(egui::Pos2, bool)>,
     pub status: String,
     pub freeze_view: bool,
     pub frozen_peaks: Option<Vec<(f32, f32)>>,
@@ -78,13 +106,17 @@ impl EditorState {
     pub fn new(ring: Arc<Mutex<RingBuffer>>) -> Self {
         Self {
             ring,
+            spare_ring: None,
             selection: None,
             drag_anchor: None,
             selection_body_press: false,
+            edge_drag: false,
+            loop_slide: None,
             view_range: (0.0, 1.0),
             is_panning: false,
             pan_start_pos: None,
             pan_start_range: (0.0, 1.0),
+            sec_press: None,
             status: "Ready - System Audio".to_string(),
             freeze_view: false,
             frozen_peaks: None,
@@ -98,6 +130,88 @@ impl EditorState {
 /// Apply duration param to the ring without reallocating (SPEC duration change).
 pub fn apply_duration(ring: &mut RingBuffer, seconds: f32) {
     let _ = ring.set_duration_rt_safe(BufferDuration::new(seconds));
+}
+
+/// Region the transport auditions: the selection when there is one, else the whole capture.
+pub fn playback_bounds(selection: Option<(f32, f32)>) -> (f32, f32) {
+    match selection {
+        Some((a, b)) => (a.min(b), a.max(b)),
+        None => (0.0, 1.0),
+    }
+}
+
+/// Transport play/pause. Pause while audio is running; otherwise audition the selection (or the
+/// whole capture when nothing is selected), resuming from the parked playhead when it still sits
+/// inside that region.
+///
+/// Recording is held still while playback runs, so this auditions exactly what was captured.
+pub fn toggle_playback(ed: &mut EditorState) -> String {
+    let playing = ed.ring.lock().is_playing();
+    if playing {
+        pause_playback_off_lock(ed);
+        return "Paused".to_string();
+    }
+    let mut ring = ed.ring.lock();
+    let (start, end) = playback_bounds(ed.selection);
+    let from = ring
+        .playhead_fraction()
+        .filter(|pos| *pos >= start && *pos < end)
+        .unwrap_or(start);
+    let started = if ed.selection.is_some() {
+        ring.loop_range(start, end, from)
+    } else {
+        ring.play_range(from, end)
+    };
+    if started {
+        "Playing".to_string()
+    } else {
+        "Nothing recorded yet.".to_string()
+    }
+}
+
+/// Pause playback without holding the ring lock across a scrub bake.
+///
+/// A scrub rotation touches up to the whole capture. `process()` shares this lock, so doing that
+/// under it can stall the audio callback. When a rotation is pending, the audio thread records
+/// into a small parking ring while the bake runs unlocked; those frames are appended afterwards.
+pub(crate) fn pause_playback_off_lock(ed: &mut EditorState) {
+    let mut guard = ed.ring.lock();
+    if guard.shift_frames() == 0 {
+        guard.pause_playback();
+        return;
+    }
+
+    let sample_rate = guard.sample_rate();
+    let paused = guard.is_paused();
+    let mut parking = match ed.spare_ring.take() {
+        Some(mut spare) if (spare.sample_rate() - sample_rate).abs() < 1.0 => {
+            spare.clear();
+            spare
+        }
+        _ => RingBuffer::new(sample_rate, BufferDuration::new(SCRUB_PARKING_SECONDS)),
+    };
+    parking.set_paused(paused);
+    let mut baked = std::mem::replace(&mut *guard, parking);
+    drop(guard);
+
+    baked.bake_scrub();
+    baked.pause_playback();
+
+    // Reattach the baked ring and append anything recorded into the parking ring meanwhile.
+    let mut guard = ed.ring.lock();
+    let parking = &mut *guard;
+    let recorded = parking.filled_frames();
+    let was_paused = baked.is_paused();
+    baked.set_paused(false);
+    for i in 0..recorded {
+        if let Some((left, right)) = parking.read_logical(i) {
+            baked.write_frame(left, right);
+        }
+    }
+    baked.set_paused(was_paused);
+    let parking = std::mem::replace(&mut *guard, baked);
+    drop(guard);
+    ed.spare_ring = Some(parking);
 }
 
 pub fn create(
@@ -129,18 +243,11 @@ pub fn create(
 
             let mut ed = shared.lock();
 
-            let (filled_frames, capacity_frames, sr, is_empty, (peak_l, peak_r)) = {
+            let (is_empty, (peak_l, peak_r)) = {
                 let mut ring = ed.ring.lock();
                 let p = ring.read_and_decay_peak();
-                (
-                    ring.filled_frames(),
-                    ring.capacity_frames(),
-                    ring.sample_rate(),
-                    ring.is_empty(),
-                    p,
-                )
+                (ring.is_empty(), p)
             };
-            let cap_secs = capacity_frames as f32 / sr.max(1.0);
             let peak = peak_l.max(peak_r);
             let db = if peak > 1e-4 {
                 20.0 * peak.log10()
@@ -201,16 +308,7 @@ pub fn create(
                 )
                 .show(egui_ctx, |ui| {
                     let wave_card_h = ui.available_height().max(16.0);
-                    draw_waveform_card(
-                        ui,
-                        &mut ed,
-                        wave_card_h,
-                        filled_frames,
-                        cap_secs,
-                        sr,
-                        is_empty,
-                        paused,
-                    );
+                    draw_waveform_card(ui, &mut ed, wave_card_h, is_empty, paused);
                 });
 
             draw_resize_grip(egui_ctx);
@@ -339,17 +437,14 @@ fn draw_side_panel(
         ui.id().with("panel_bg_drag"),
         egui::Sense::drag(),
     );
-    if !pointer_in_grip
-        && (bg_drag.drag_started()
-            || (bg_drag.contains_pointer() && ui.input(|i| i.pointer.primary_pressed())))
-    {
+    if !pointer_in_grip && panel_background_starts_move(&bg_drag) {
         crate::chrome::begin_move();
     }
 
     let overflow_tier1 = avail_h < FULL_STACK_NEEDED_H;
     let overflow_tier2 = avail_h < TIER1_STACK_NEEDED_H;
     let compact = avail_h < 120.0;
-    let skull_only = avail_h < 200.0;
+    let logo_only = avail_h < 200.0;
 
     if ui.available_height() >= if compact { 48.0_f32 } else { H_BRAND } {
         let brand_h = if compact { 18.0 } else { H_BRAND };
@@ -361,7 +456,7 @@ fn draw_side_panel(
             egui::vec2(badge_w, badge_h),
         );
         draw_logo_mark(ui, ui.painter(), badge_rect);
-        if !compact && !skull_only {
+        if !compact && !logo_only {
             ui.painter().text(
                 egui::pos2(badge_rect.right() + 6.0, brand_rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -418,7 +513,7 @@ fn draw_side_panel(
                 ui.add_space((rem_h * 0.5).floor());
             }
         }
-        draw_side_by_side_source_toggle(ui, ed, full_w, !has_top_brand);
+        draw_side_by_side_source_toggle(ui, setter, params, ed, full_w, !has_top_brand);
     }
 
     // Buffer slider inline when window is tall enough
@@ -459,6 +554,10 @@ fn draw_side_panel(
             crate::chrome::begin_move();
         }
     }
+}
+
+fn panel_background_starts_move(response: &egui::Response) -> bool {
+    response.drag_started_by(egui::PointerButton::Primary)
 }
 
 fn draw_header_more_menu(
@@ -774,6 +873,8 @@ fn draw_stacked_source_toggle(ui: &mut egui::Ui, ed: &mut EditorState, width: f3
 
 fn draw_side_by_side_source_toggle(
     ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &Arc<PirateSamplerParams>,
     ed: &mut EditorState,
     width: f32,
     show_inline_logo: bool,
@@ -782,10 +883,31 @@ fn draw_side_by_side_source_toggle(
     let gap = 6.0;
     let (row_rect, _) = ui.allocate_exact_size(egui::vec2(width, seg_h), egui::Sense::hover());
 
-    let start_x = if show_inline_logo {
+    // Inline-logo rows right-align both source buttons so the logo badge and gain knob fit to
+    // their left; otherwise the pair fills the available width.
+    let half = if show_inline_logo {
+        seg_h
+    } else {
+        ((row_rect.width() - gap) * 0.5).max(20.0)
+    };
+    let source_x = if show_inline_logo {
+        // Keep the rightmost button clear of the window's bottom-right resize grip.
+        row_rect.right() - 16.0 - 2.0 * half - gap
+    } else {
+        row_rect.left()
+    };
+
+    if show_inline_logo {
         let badge_h = seg_h;
         let badge_w = (seg_h * (52.0 / 44.0)).round();
-        let badge_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(badge_w, badge_h));
+        // The gain knob sits between the badge and the buttons, with `gap` on either side.
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                source_x - gap - GAIN_KNOB_SIZE - gap - badge_w,
+                row_rect.top(),
+            ),
+            egui::vec2(badge_w, badge_h),
+        );
         draw_logo_mark(ui, ui.painter(), badge_rect);
         let drag_resp = ui.interact(
             badge_rect,
@@ -800,18 +922,14 @@ fn draw_side_by_side_source_toggle(
         {
             crate::chrome::begin_move();
         }
-        badge_rect.right() + gap
-    } else {
-        row_rect.left()
-    };
+    }
 
-    let avail_btn_w = (row_rect.right() - start_x).max(40.0);
-    let half = ((avail_btn_w - gap) * 0.5).max(20.0);
-
-    let sys_rect =
-        egui::Rect::from_min_size(egui::pos2(start_x, row_rect.top()), egui::vec2(half, seg_h));
+    let sys_rect = egui::Rect::from_min_size(
+        egui::pos2(source_x, row_rect.top()),
+        egui::vec2(half, seg_h),
+    );
     let mic_rect = egui::Rect::from_min_size(
-        egui::pos2(start_x + half + gap, row_rect.top()),
+        egui::pos2(source_x + half + gap, row_rect.top()),
         egui::vec2(half, seg_h),
     );
 
@@ -820,6 +938,14 @@ fn draw_side_by_side_source_toggle(
 
     if sys_resp.hovered() || mic_resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if show_inline_logo {
+        let gain_center = egui::pos2(
+            sys_rect.left() - gap - GAIN_KNOB_RADIUS,
+            row_rect.center().y,
+        );
+        draw_playback_gain(ui, setter, params, gain_center, false);
     }
 
     let painter = ui.painter();
@@ -835,13 +961,17 @@ fn draw_side_by_side_source_toggle(
                 theme::ACCENT
             };
             painter.rect_filled(rect, egui::CornerRadius::same(theme::CONTROL_RADIUS), fill);
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                theme::font_small(),
-                theme::BG,
-            );
+            if show_inline_logo {
+                draw_compact_source_icon(painter, rect.center(), source, theme::BG);
+            } else {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    theme::font_small(),
+                    theme::BG,
+                );
+            }
         } else {
             if resp.hovered() {
                 painter.rect_filled(
@@ -866,22 +996,95 @@ fn draw_side_by_side_source_toggle(
                 egui::Stroke::new(1.0_f32, stroke_col),
                 egui::StrokeKind::Inside,
             );
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                theme::font_small(),
-                text_col,
-            );
+            if show_inline_logo {
+                draw_compact_source_icon(painter, rect.center(), source, text_col);
+            } else {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    theme::font_small(),
+                    text_col,
+                );
+            }
         }
     }
-
     if sys_resp.clicked() && ed.input_source != AudioInputSource::SystemAudio {
         ed.input_source = AudioInputSource::SystemAudio;
         ed.status = switch_input_source(&mut ed.active_links, AudioInputSource::SystemAudio);
     } else if mic_resp.clicked() && ed.input_source != AudioInputSource::Microphone {
         ed.input_source = AudioInputSource::Microphone;
         ed.status = switch_input_source(&mut ed.active_links, AudioInputSource::Microphone);
+    }
+}
+
+fn draw_compact_source_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    source: AudioInputSource,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    match source {
+        AudioInputSource::SystemAudio => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(-6.0, -3.0),
+                    center + egui::vec2(-3.0, -3.0),
+                    center + egui::vec2(1.0, -6.0),
+                    center + egui::vec2(1.0, 6.0),
+                    center + egui::vec2(-3.0, 3.0),
+                    center + egui::vec2(-6.0, 3.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.line_segment(
+                [
+                    center + egui::vec2(4.0, -3.0),
+                    center + egui::vec2(6.0, 0.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [center + egui::vec2(6.0, 0.0), center + egui::vec2(4.0, 3.0)],
+                stroke,
+            );
+        }
+        AudioInputSource::Microphone => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(0.0, -2.0), egui::vec2(6.0, 9.0)),
+                egui::CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-5.0, 0.0),
+                    center + egui::vec2(-5.0, 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-5.0, 3.0),
+                    center + egui::vec2(0.0, 5.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [center + egui::vec2(0.0, 5.0), center + egui::vec2(5.0, 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + egui::vec2(5.0, 3.0), center + egui::vec2(5.0, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + egui::vec2(0.0, 5.0), center + egui::vec2(0.0, 8.0)],
+                stroke,
+            );
+        }
     }
 }
 
@@ -892,11 +1095,17 @@ fn draw_buffer_section(
     width: f32,
 ) {
     let (sec_rect, _) = ui.allocate_exact_size(egui::vec2(width, H_BUFFER), egui::Sense::hover());
-    let label_rect = egui::Rect::from_min_size(sec_rect.min, egui::vec2(width, 14.0));
+    let buffer_width = (width - BUFFER_GAIN_RESERVE).max(20.0);
+    let label_rect = egui::Rect::from_min_size(sec_rect.min, egui::vec2(buffer_width, 14.0));
     let slider_rect = egui::Rect::from_min_size(
         egui::pos2(sec_rect.left(), sec_rect.top() + 16.0),
-        egui::vec2(width, 18.0),
+        egui::vec2(buffer_width, 18.0),
     );
+    let gain_center = egui::pos2(
+        sec_rect.right() - GAIN_KNOB_INSET,
+        sec_rect.center().y + 3.0,
+    );
+    draw_playback_gain(ui, setter, params, gain_center, true);
 
     let mut secs = params.buffer_seconds.value();
     ui.painter().text(
@@ -919,6 +1128,72 @@ fn draw_buffer_section(
         setter.set_parameter(&params.buffer_seconds, secs);
         setter.end_set_parameter(&params.buffer_seconds);
     }
+}
+
+fn draw_playback_gain(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &Arc<PirateSamplerParams>,
+    center: egui::Pos2,
+    show_label: bool,
+) {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(GAIN_KNOB_SIZE, GAIN_KNOB_SIZE));
+    // The inline and buffer layouts never share a frame, but distinct IDs keep drag state from
+    // leaking between them if that ever changes.
+    let response = ui.interact(
+        rect,
+        ui.id().with(("playback_gain", show_label)),
+        egui::Sense::click_and_drag(),
+    );
+    let gain = params.playback_gain_db.value();
+    let drag_id = response.id.with("start_gain");
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().data_mut(|data| data.insert_temp(drag_id, gain));
+        setter.begin_set_parameter(&params.playback_gain_db);
+    }
+    if response.dragged_by(egui::PointerButton::Primary) {
+        let start_gain = ui.ctx().data(|data| data.get_temp::<f32>(drag_id));
+        let origin = ui.input(|input| input.pointer.press_origin());
+        if let (Some(start_gain), Some(origin), Some(position)) =
+            (start_gain, origin, response.interact_pointer_pos())
+        {
+            let value = playback_gain_from_drag(start_gain, position.y - origin.y);
+            setter.set_parameter(&params.playback_gain_db, value);
+        }
+    }
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
+        setter.end_set_parameter(&params.playback_gain_db);
+        ui.ctx().data_mut(|data| data.remove::<f32>(drag_id));
+    }
+    if response.double_clicked_by(egui::PointerButton::Primary) {
+        setter.begin_set_parameter(&params.playback_gain_db);
+        setter.set_parameter(&params.playback_gain_db, 0.0);
+        setter.end_set_parameter(&params.playback_gain_db);
+    }
+    let painter = ui.painter();
+    if show_label {
+        painter.text(
+            egui::pos2(center.x, center.y - 20.0),
+            egui::Align2::CENTER_TOP,
+            "GAIN",
+            theme::font_tiny(),
+            theme::MUTED,
+        );
+    }
+    painter.circle_filled(center, 10.0, theme::TRACK_FILL);
+    painter.circle_stroke(center, 10.0, egui::Stroke::new(1.0_f32, theme::STROKE));
+    let angle = std::f32::consts::PI
+        * (0.75
+            + (gain - PLAYBACK_GAIN_MIN_DB) / (PLAYBACK_GAIN_MAX_DB - PLAYBACK_GAIN_MIN_DB) * 1.5);
+    let tip = center + egui::vec2(angle.cos(), angle.sin()) * 7.0;
+    painter.line_segment([center, tip], egui::Stroke::new(2.0_f32, theme::ACCENT));
+    response.on_hover_text(format!(
+        "Playback gain: {gain:.1} dB\nDrag up/down; double-click to reset"
+    ));
+}
+
+fn playback_gain_from_drag(start_gain: f32, vertical_distance: f32) -> f32 {
+    (start_gain - vertical_distance * 0.5).clamp(PLAYBACK_GAIN_MIN_DB, PLAYBACK_GAIN_MAX_DB)
 }
 
 fn draw_buffer_slider_in_rect(
@@ -1366,4 +1641,152 @@ fn truncate_status_to_width(
         }
     }
     chars[..lo].iter().collect::<String>() + "..."
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use pirate_sampler_dsp::RingBuffer;
+
+    use super::*;
+
+    #[test]
+    fn gain_drag_does_not_start_panel_move() {
+        let ctx = egui::Context::default();
+        let knob = egui::Rect::from_min_size(
+            egui::pos2(30.0, 30.0),
+            egui::vec2(GAIN_KNOB_SIZE, GAIN_KNOB_SIZE),
+        );
+        let start = knob.center();
+        let mut move_started = false;
+        let mut knob_dragged = false;
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            vec![egui::Event::PointerMoved(start + egui::vec2(0.0, -15.0))],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let bg = ui.interact(
+                        ui.max_rect(),
+                        ui.id().with("panel_bg_drag"),
+                        egui::Sense::drag(),
+                    );
+                    move_started |= panel_background_starts_move(&bg);
+                    let response = ui.interact(
+                        knob,
+                        ui.id().with(("playback_gain", true)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    knob_dragged |= response.dragged_by(egui::PointerButton::Primary);
+                });
+            });
+        }
+        assert!(!move_started, "knob press must not start window movement");
+        assert!(knob_dragged, "primary drag must reach the gain knob");
+    }
+
+    #[test]
+    fn playback_gain_drag_uses_total_vertical_distance() {
+        assert_eq!(playback_gain_from_drag(0.0, -10.0), 5.0);
+        assert_eq!(playback_gain_from_drag(0.0, 10.0), -5.0);
+        assert_eq!(playback_gain_from_drag(0.0, -30.0), 15.0);
+        assert_eq!(playback_gain_from_drag(0.0, -100.0), 24.0);
+        assert_eq!(playback_gain_from_drag(0.0, 200.0), -60.0);
+        assert_eq!(playback_gain_from_drag(0.0, 0.5), -0.25);
+    }
+
+    /// Editor whose ring holds `frames` frames valued by their logical index.
+    fn editor_with_frames(frames: usize) -> EditorState {
+        let ring = RingBuffer::with_capacity(48_000.0, (frames * 2).max(2));
+        let ed = EditorState::new(Arc::new(Mutex::new(ring)));
+        {
+            let mut ring = ed.ring.lock();
+            for i in 0..frames {
+                ring.write_frame(i as f32, -(i as f32));
+            }
+        }
+        ed
+    }
+
+    #[test]
+    fn transport_toggles_play_and_pause() {
+        let mut ed = editor_with_frames(8);
+        assert_eq!(toggle_playback(&mut ed), "Playing");
+        assert!(ed.ring.lock().is_playing());
+        assert_eq!(toggle_playback(&mut ed), "Paused");
+        assert!(!ed.ring.lock().is_playing());
+    }
+
+    #[test]
+    fn pausing_a_scrubbed_loop_keeps_the_rotation_and_releases_the_audio_lock() {
+        let mut ed = editor_with_frames(8);
+        ed.selection = Some((0.25, 0.5));
+        assert_eq!(toggle_playback(&mut ed), "Playing");
+        assert_eq!(ed.ring.lock().shift_content(-2), -2);
+
+        assert_eq!(toggle_playback(&mut ed), "Paused");
+
+        let ring = ed.ring.lock();
+        assert_eq!(ring.shift_frames(), 0, "the scrub must be baked in");
+        assert_eq!(ring.read_logical(2), Some((4.0, -4.0)));
+        assert_eq!(ring.read_logical(0), Some((2.0, -2.0)));
+        assert_eq!(
+            ring.filled_frames(),
+            8,
+            "the bake must preserve the capture"
+        );
+        drop(ring);
+        assert!(ed.spare_ring.is_some(), "the parking ring is retained");
+    }
+
+    #[test]
+    fn transport_loops_only_the_selection() {
+        let mut ed = editor_with_frames(8);
+        ed.selection = Some((0.5, 0.75));
+        assert_eq!(toggle_playback(&mut ed), "Playing");
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((4.0, -4.0)));
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((5.0, -5.0)));
+        assert_eq!(
+            ed.ring.lock().next_playback_frame(),
+            Some((4.0, -4.0)),
+            "playback must loop to the selection start"
+        );
+    }
+
+    #[test]
+    fn transport_resumes_from_the_parked_playhead() {
+        let mut ed = editor_with_frames(8);
+        ed.selection = Some((0.5, 1.0));
+        assert_eq!(toggle_playback(&mut ed), "Playing");
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((4.0, -4.0)));
+        assert_eq!(toggle_playback(&mut ed), "Paused");
+        assert_eq!(toggle_playback(&mut ed), "Playing");
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((5.0, -5.0)));
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((6.0, -6.0)));
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((7.0, -7.0)));
+        assert_eq!(ed.ring.lock().next_playback_frame(), Some((4.0, -4.0)));
+    }
+
+    #[test]
+    fn transport_without_audio_reports_nothing_to_play() {
+        let mut ed = editor_with_frames(0);
+        assert_eq!(toggle_playback(&mut ed), "Nothing recorded yet.");
+        assert!(!ed.ring.lock().is_playing());
+    }
 }
