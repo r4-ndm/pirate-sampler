@@ -171,6 +171,7 @@ The desktop entry does not need to be rewritten unless you change its `Exec` or 
 rm -f "$HOME/.local/bin/pirate-sampler"
 rm -f "$HOME/.local/share/applications/pirate-sampler.desktop"
 rm -f "$HOME/.local/share/icons/hicolor/256x256/apps/pirate-sampler.png"
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/pirate-sampler/window-size"
 ```
 
 If you used the system-wide install, remove it separately:

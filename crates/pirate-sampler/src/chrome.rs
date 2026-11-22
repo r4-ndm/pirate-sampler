@@ -75,8 +75,8 @@ mod imp {
 
     /// Keep the window usable: the side panel plus a workable waveform. The height
     /// floor is low on purpose — the panel drops to a single row of controls.
-    const MIN_W: i32 = 560;
-    const MIN_H: i32 = 44;
+    const MIN_W: i32 = crate::window_state::MIN_WINDOW_SIZE.0 as i32;
+    const MIN_H: i32 = crate::window_state::MIN_WINDOW_SIZE.1 as i32;
 
     static CHROME: Mutex<Option<Chrome>> = Mutex::new(None);
     static MOVE: Mutex<Option<MoveState>> = Mutex::new(None);
@@ -347,6 +347,7 @@ mod imp {
                 }
             }
             if !down {
+                crate::window_state::save_window_size(state.applied);
                 if let Ok(mut slot) = RESIZE.lock() {
                     *slot = None;
                 }

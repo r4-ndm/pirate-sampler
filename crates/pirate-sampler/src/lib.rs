@@ -5,6 +5,7 @@ pub mod params;
 pub mod routing;
 pub mod theme;
 pub mod waveform;
+mod window_state;
 pub mod xdnd;
 
 use std::sync::Arc;
@@ -44,17 +45,22 @@ pub struct PirateSampler {
 
 impl Default for PirateSampler {
     fn default() -> Self {
+        let is_standalone = is_standalone();
+        let initial_size = if is_standalone {
+            window_state::load_window_size().unwrap_or(window_state::DEFAULT_WINDOW_SIZE)
+        } else {
+            window_state::DEFAULT_WINDOW_SIZE
+        };
         let params = PirateSamplerParams::new_arc();
         let ring = Arc::new(Mutex::new(RingBuffer::with_max_duration(
             48_000.0,
             BufferDuration::default(),
         )));
         let gui = Arc::new(Mutex::new(editor::EditorState::new(Arc::clone(&ring))));
-        let is_standalone = is_standalone();
         Self {
             params,
             ring,
-            editor_state: EguiState::from_size(840, 400),
+            editor_state: EguiState::from_size(initial_size.0, initial_size.1),
             gui,
             last_duration_secs: BUFFER_DURATION_DEFAULT,
             is_standalone,

@@ -26,6 +26,7 @@ state/automation is not wired up. Do not build host-specific features without a 
 - **Playback**: right-click loops a selection or plays the whole capture once; playback freezes recording
 - **Live loop resize and scrub**: drag a brace edge while looping, or drag outside the brace to scrub under it
 - **Playback gain**: -60 … +24 dB, smoothed, playback only
+- **Remembers its last window size** between launches
 - Waveform GUI with region select + **Export WAV** (32-bit float, host sample rate)
 - Reported latency: **0 samples**
 

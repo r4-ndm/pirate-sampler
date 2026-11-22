@@ -52,6 +52,7 @@ Do not match undocumented behavior of any third-party product.
 - **Pause** control: when paused, ring buffer is not written; pass-through continues.
 - **Pan / zoom**: supported — right-drag pans the view; right-click toggles playback.
 - Playback gain knob (see Playback & looping).
+- Window size is remembered between launches.
 
 ## Transport
 
@@ -81,3 +82,4 @@ CLAP, BPM in filenames, MIDI, user-selectable themes.
 | A9 | Live loop resize | Drag a brace edge while looping; the next output frames follow the new range without restarting |
 | A10 | Playback gain | Played frames use the gain value; bypass/pass-through and recording are unaffected |
 | A11 | Scrub edit | While a loop plays, drag outside the brace; the loop reads different frames; after stopping, the rotated content is retained |
+| A12 | Window size memory | Resize the standalone window, close the app, and reopen it; the window opens at the last size |

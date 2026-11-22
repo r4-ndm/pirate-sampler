@@ -19,8 +19,8 @@ use crate::theme;
 use crate::waveform::draw_waveform_card;
 
 // Window and layout geometry constants (840 x 400 compact side-panel layout)
-pub const WINDOW_W: f32 = 840.0;
-pub const WINDOW_H: f32 = 400.0;
+pub const WINDOW_W: f32 = crate::window_state::DEFAULT_WINDOW_SIZE.0 as f32;
+pub const WINDOW_H: f32 = crate::window_state::DEFAULT_WINDOW_SIZE.1 as f32;
 pub const SIDE_W: f32 = 176.0;
 pub const MIN_WAVEFORM_W: f32 = 320.0;
 pub const LEFT_MARGIN: i8 = 12;
@@ -224,6 +224,7 @@ pub fn create(
         assert!((WAVEFORM_H - (WINDOW_H - VERTICAL_MARGINS)).abs() < f32::EPSILON);
     }
 
+    let initial_window_size = editor_state.size();
     create_egui_editor(
         editor_state,
         (),
@@ -235,7 +236,7 @@ pub fn create(
 
             #[cfg(target_os = "linux")]
             if let Some(window_id) = nih_plug_egui::parent_x11_window() {
-                crate::chrome::attach(window_id, WINDOW_W as u32, WINDOW_H as u32);
+                crate::chrome::attach(window_id, initial_window_size.0, initial_window_size.1);
             }
             crate::chrome::pump_move();
             crate::chrome::pump_resize();
