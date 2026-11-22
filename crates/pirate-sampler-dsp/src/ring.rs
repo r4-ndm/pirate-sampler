@@ -2,6 +2,18 @@
 
 use crate::params::{buffer_capacity_frames, BufferDuration, NUM_CHANNELS};
 
+/// Frames spent crossfading one scrub offset change (about 2.7 ms at 48 kHz).
+const SCRUB_FADE_FRAMES: u32 = 128;
+
+/// Linear crossfade between the old and new scrub read offsets.
+#[derive(Debug, Clone, Copy)]
+struct ScrubFade {
+    from: i64,
+    to: i64,
+    elapsed: u32,
+    len: u32,
+}
+
 /// Inclusive-exclusive selection in "logical" timeline frames:
 /// `0` is the oldest retained sample, `len()` is one past the newest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +62,8 @@ pub struct RingBuffer {
     loop_start_abs: Option<u64>,
     /// Frames the captured audio has been rotated under the playhead (audition scrubbing).
     shift: i64,
+    /// Crossfade currently easing a scrub change into playback.
+    scrub_fade: Option<ScrubFade>,
     /// Whether playback is currently advancing.
     playing: bool,
     paused: bool,
@@ -91,6 +105,7 @@ impl RingBuffer {
             play_end_abs: 0,
             loop_start_abs: None,
             shift: 0,
+            scrub_fade: None,
             playing: false,
             paused: false,
             sample_rate: sample_rate.max(1.0),
@@ -197,6 +212,7 @@ impl RingBuffer {
         self.play_end_abs = 0;
         self.loop_start_abs = None;
         self.shift = 0;
+        self.scrub_fade = None;
         self.playing = false;
         self.recent_peak_l = 0.0;
         self.recent_peak_r = 0.0;
@@ -358,13 +374,28 @@ impl RingBuffer {
     /// The loop window and playhead stay where they are: the audio moves underneath them, so the
     /// loop auditions whatever material was scrubbed into it. Recording is frozen during playback,
     /// so this is a pure edit and is folded into the buffers when playback stops (see
-    /// [`Self::bake_shift`]). The rotation wraps inside the filled audio. Returns the applied delta.
+    /// [`Self::bake_shift`]). The rotation wraps inside the filled audio. Playback crossfades to
+    /// the new offset instead of jumping straight to it, so pointer-sized steps do not click.
+    /// Returns the applied delta.
     pub fn shift_content(&mut self, delta: i64) -> i64 {
         if !self.is_looping() || self.filled == 0 || delta == 0 {
             return 0;
         }
+        let previous = self.shift;
         self.shift += delta;
+        if self.scrub_fade.is_none() {
+            self.start_scrub_fade(previous, self.shift);
+        }
         delta
+    }
+
+    fn start_scrub_fade(&mut self, from: i64, to: i64) {
+        self.scrub_fade = (from != to).then_some(ScrubFade {
+            from,
+            to,
+            elapsed: 0,
+            len: SCRUB_FADE_FRAMES,
+        });
     }
 
     /// Fold the audition rotation into the stored audio so a scrub survives after playback stops.
@@ -378,8 +409,9 @@ impl RingBuffer {
     /// Fold the audition rotation into the stored audio so a scrub survives after playback stops.
     fn bake_shift(&mut self) {
         let filled = self.filled;
-        if filled == 0 || self.shift == 0 {
+        if filled == 0 {
             self.shift = 0;
+            self.scrub_fade = None;
             return;
         }
         let s = self.shift.rem_euclid(filled as i64) as usize;
@@ -389,6 +421,7 @@ impl RingBuffer {
             self.right[..filled].rotate_right(s);
         }
         self.shift = 0;
+        self.scrub_fade = None;
     }
 
     /// Wrap a logical offset (possibly negative) into the filled audio.
@@ -440,17 +473,34 @@ impl RingBuffer {
             // be an RT violation. Clear defensively rather than ever doing that work here.
             debug_assert_eq!(self.shift, 0, "one-shot playback cannot be scrubbed");
             self.shift = 0;
+            self.scrub_fade = None;
             return None;
         }
-        let logical = pos - self.oldest_abs();
-        let i = self.physical_index(self.wrapped_logical(logical as i64 - self.shift));
+        // Both scrub taps advance with the playhead, so the fade is a blend of the audio before
+        // and after the pointer move rather than a frozen loop. A later scrub update while this
+        // fade is running only moves the target; it starts its own fade once this one finishes.
+        let logical = (pos - self.oldest_abs()) as i64;
+        let frame = if let Some(mut fade) = self.scrub_fade {
+            let t = (fade.elapsed + 1) as f32 / fade.len as f32;
+            let from = self.frame_at_logical(logical - fade.from);
+            let to = self.frame_at_logical(logical - fade.to);
+            let frame = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            fade.elapsed += 1;
+            self.scrub_fade = (fade.elapsed < fade.len).then_some(fade);
+            if self.scrub_fade.is_none() && self.shift != fade.to {
+                self.start_scrub_fade(fade.to, self.shift);
+            }
+            frame
+        } else {
+            self.frame_at_logical(logical - self.shift)
+        };
         let next = pos + 1;
         self.play_abs = Some(if next >= self.play_end_abs {
             self.loop_start_abs.unwrap_or(next)
         } else {
             next
         });
-        Some((self.left[i], self.right[i]))
+        Some(frame)
     }
 
     /// Map logical index (`0` = oldest) to physical storage index.
@@ -464,13 +514,20 @@ impl RingBuffer {
         }
     }
 
+    /// Read a stereo frame at an arbitrary logical offset, wrapping inside the filled audio.
+    #[inline]
+    fn frame_at_logical(&self, logical: i64) -> (f32, f32) {
+        debug_assert!(self.filled > 0);
+        let i = self.physical_index(self.wrapped_logical(logical));
+        (self.left[i], self.right[i])
+    }
+
     /// Read one frame at a logical index. Returns `None` if out of range.
     pub fn read_logical(&self, logical: usize) -> Option<(f32, f32)> {
         if logical >= self.filled {
             return None;
         }
-        let i = self.physical_index(self.wrapped_logical(logical as i64 - self.shift));
-        Some((self.left[i], self.right[i]))
+        Some(self.frame_at_logical(logical as i64 - self.shift))
     }
 
     /// Copy a logical selection into interleaved stereo `f32` samples.
@@ -715,6 +772,10 @@ mod tests {
         assert_eq!(rb.next_playback_frame(), Some((2.0, -2.0)));
 
         assert_eq!(rb.shift_content(-2), -2, "audio moves two frames earlier");
+        // The new offset is eased in; drain the crossfade before checking settled output.
+        for _ in 0..SCRUB_FADE_FRAMES {
+            assert!(rb.next_playback_frame().is_some());
+        }
         assert_eq!(rb.next_playback_frame(), Some((5.0, -5.0)));
         assert_eq!(rb.next_playback_frame(), Some((4.0, -4.0)));
         assert_eq!(
@@ -724,6 +785,31 @@ mod tests {
         );
         // The playhead keeps sweeping the same 2..4 window.
         assert_eq!(rb.playhead_fraction(), Some(0.25));
+    }
+
+    #[test]
+    fn scrubbing_crossfades_instead_of_jumping_playback() {
+        let mut rb = filled_ring(4_800);
+        assert!(rb.loop_range(0.0, 1.0, 0.0));
+        let mut last = 0.0;
+        for _ in 0..10 {
+            last = rb.next_playback_frame().unwrap().0;
+        }
+        assert_eq!(last, 9.0);
+        assert_eq!(rb.shift_content(1_000), 1_000);
+
+        let mut prev = last;
+        let mut max_step = 0.0f32;
+        for _ in 0..SCRUB_FADE_FRAMES {
+            let current = rb.next_playback_frame().unwrap().0;
+            max_step = max_step.max((current - prev).abs());
+            prev = current;
+        }
+        assert!(
+            max_step < 50.0,
+            "a scrub must crossfade, but the output jumped by {max_step} between samples"
+        );
+        assert!(prev > 1_000.0, "playback must reach the new offset");
     }
 
     #[test]
@@ -753,6 +839,9 @@ mod tests {
         assert_eq!(rb.next_playback_frame(), Some((4.0, -4.0)));
 
         assert_eq!(rb.shift_content(-1), -1);
+        for _ in 0..SCRUB_FADE_FRAMES {
+            assert!(rb.next_playback_frame().is_some());
+        }
         assert_eq!(
             rb.next_playback_frame(),
             Some((6.0, -6.0)),
