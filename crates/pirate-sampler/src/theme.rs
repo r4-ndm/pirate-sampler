@@ -1,23 +1,23 @@
 use nih_plug_egui::egui::{self, Color32, CornerRadius, FontId, Margin, Stroke, Visuals};
 
-// Pure monochrome greyscale palette — zero hue anywhere
-pub const BG: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
-pub const PANEL: Color32 = Color32::from_rgb(0x0B, 0x0B, 0x0B);
-pub const CARD: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
-pub const STROKE: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x2E);
-pub const TEXT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-pub const MUTED: Color32 = Color32::from_rgb(0x9A, 0x9A, 0x9A);
-pub const DISABLED_TEXT: Color32 = Color32::from_rgb(0x6A, 0x6A, 0x6A);
-pub const ACCENT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xE8, 0xE8, 0xE8);
-pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+// Warm enamel, amber indicators, and cream lettering inspired by vintage equipment.
+pub const BG: Color32 = Color32::from_rgb(0x17, 0x13, 0x0F);
+pub const PANEL: Color32 = Color32::from_rgb(0x30, 0x27, 0x1E);
+pub const CARD: Color32 = Color32::from_rgb(0x41, 0x36, 0x2A);
+pub const STROKE: Color32 = Color32::from_rgb(0x78, 0x64, 0x4C);
+pub const TEXT: Color32 = Color32::from_rgb(0xF3, 0xE4, 0xC2);
+pub const MUTED: Color32 = Color32::from_rgb(0xBA, 0xA5, 0x87);
+pub const DISABLED_TEXT: Color32 = Color32::from_rgb(0x78, 0x6B, 0x59);
+pub const ACCENT: Color32 = Color32::from_rgb(0xDB, 0x9D, 0x44);
+pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xFF, 0xD1, 0x8A);
+pub const DANGER: Color32 = Color32::from_rgb(0xDB, 0x68, 0x4C);
 
-// Additional monochrome surface/line constants
-pub const HOVER_FILL: Color32 = Color32::from_rgb(0x1A, 0x1A, 0x1A);
-pub const TRACK_FILL: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
-pub const DISABLED_STROKE: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3A);
-pub const GRID_LINE: Color32 = Color32::from_rgb(0x24, 0x24, 0x24);
-pub const ZERO_LINE: Color32 = Color32::from_rgb(0x44, 0x44, 0x44);
+// Surface and line colors
+pub const HOVER_FILL: Color32 = Color32::from_rgb(0x58, 0x46, 0x32);
+pub const TRACK_FILL: Color32 = Color32::from_rgb(0x1B, 0x18, 0x13);
+pub const DISABLED_STROKE: Color32 = Color32::from_rgb(0x55, 0x49, 0x3A);
+pub const GRID_LINE: Color32 = Color32::from_rgb(0x40, 0x33, 0x24);
+pub const ZERO_LINE: Color32 = Color32::from_rgb(0x6D, 0x58, 0x39);
 
 // Geometry tokens (hard-edged instrument panel: every corner is square)
 pub const CARD_RADIUS: u8 = 0;
@@ -73,14 +73,14 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     visuals.widgets.inactive.corner_radius = ctrl_radius;
 
-    // Hover: #E8E8E8 stroke on a #1A1A1A fill
+    // Warm highlight on hover
     visuals.widgets.hovered.bg_fill = HOVER_FILL;
     visuals.widgets.hovered.weak_bg_fill = HOVER_FILL;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_HOVER);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, TEXT);
     visuals.widgets.hovered.corner_radius = ctrl_radius;
 
-    // Active/pressed widgets: white fill with BLACK text
+    // Illuminated pressed controls
     visuals.widgets.active.bg_fill = ACCENT;
     visuals.widgets.active.weak_bg_fill = ACCENT;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
@@ -93,8 +93,8 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
     visuals.widgets.open.corner_radius = ctrl_radius;
 
-    // selection.bg_fill = white at alpha 40; selection.stroke = white 1 px
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 40);
+    // Translucent amber selection
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0xDB, 0x9D, 0x44, 40);
     visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     style.visuals = visuals;

@@ -32,19 +32,26 @@ pub const VERTICAL_MARGINS: f32 = (TOP_MARGIN as f32) + (BOTTOM_MARGIN as f32);
 pub const WAVEFORM_H: f32 = WINDOW_H - VERTICAL_MARGINS;
 
 /// Compact playback-gain knob diameter, shared by both side-panel layouts.
-const GAIN_KNOB_SIZE: f32 = 26.0;
+// The Teragon filmstrip is 68 px per frame. Drawing it at 26 px threw away
+// most of the artwork and read as a thumbnail rather than a control; a real
+// panel knob is a feature of the layout, not a detail. H_BUFFER and
+// BUFFER_GAIN_RESERVE below are sized to this, so change them together.
+const GAIN_KNOB_SIZE: f32 = 44.0;
 const GAIN_KNOB_RADIUS: f32 = GAIN_KNOB_SIZE * 0.5;
+/// Frames in the Teragon knob filmstrip (`small_knob_135frames.png`, 68x9180).
+/// Must match the artwork: the uv window is `1.0 / KNOB_FRAMES` tall.
+const KNOB_FRAMES: usize = 135;
 /// Right-edge inset used by the buffer row's gain knob.
 const GAIN_KNOB_INSET: f32 = 16.0;
 /// Width reserved on the buffer row for the gain knob beside the slider.
-const BUFFER_GAIN_RESERVE: f32 = 48.0;
+const BUFFER_GAIN_RESERVE: f32 = 66.0;
 /// Audio recorded while a scrub bake runs is parked in a ring this long.
 const SCRUB_PARKING_SECONDS: f32 = 2.0;
 
 // Side-panel block heights for deterministic overflow calculation
 const H_BRAND: f32 = 24.0;
 const H_SOURCE_TOGGLE: f32 = 54.0; // 24 + 6 + 24
-const H_BUFFER: f32 = 34.0; // 14 label + 2 gap + 18 slider
+const H_BUFFER: f32 = 48.0; // 14 label + 2 gap + 18 slider, floored by the 44 px gain knob
 const H_TRANSPORT: f32 = 108.0; // 4 * 24 + 3 * 4
 const H_MORE_BTN: f32 = 24.0;
 const H_EXPORT: f32 = 28.0;
@@ -421,6 +428,78 @@ fn draw_side_panel(
     peak_hold_norm: f32,
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(6.0, SECTION_GAP);
+    let metal = hardware_texture(
+        ui,
+        "hardware_metal",
+        include_bytes!("../../../assets/metal-tile.png"),
+        egui::TextureOptions::LINEAR,
+    );
+    // Extend the faceplate into the frame margins without changing the control layout.
+    let panel_rect = ui.max_rect().expand2(egui::vec2(10.0, 6.0));
+    let painter = ui
+        .painter()
+        .with_clip_rect(panel_rect.intersect(ui.ctx().screen_rect()));
+    let mut y = panel_rect.top();
+    while y < panel_rect.bottom() {
+        let mut x = panel_rect.left();
+        while x < panel_rect.right() {
+            let tile = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(256.0, 256.0));
+            painter.image(
+                metal.id(),
+                tile,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                // Barely-warm tint. The artwork is grey brushed aluminium, and a
+                // strong tan multiply turned it into wood grain, which also
+                // fought the cold grey of the Teragon buttons sitting on it.
+                // Keeping it near-neutral reads as a 70s alloy faceplate and
+                // lets the amber indicators do the warming.
+                Color32::from_rgb(188, 182, 172),
+            );
+            x += 256.0;
+        }
+        y += 256.0;
+    }
+
+    // A dark recessed edge and a fine top highlight give the plate some thickness.
+    painter.rect_stroke(
+        panel_rect.shrink(0.5),
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 21, 18)),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            panel_rect.left_top() + egui::vec2(1.0, 1.0),
+            panel_rect.right_top() + egui::vec2(-1.0, 1.0),
+        ],
+        egui::Stroke::new(1.0_f32, Color32::from_rgb(150, 133, 108)),
+    );
+    painter.line_segment(
+        [
+            panel_rect.left_top() + egui::vec2(1.0, 1.0),
+            panel_rect.left_bottom() + egui::vec2(1.0, -1.0),
+        ],
+        egui::Stroke::new(1.0_f32, Color32::from_rgb(118, 104, 85)),
+    );
+    // Mounting screws sit in the outer margin, clear of the controls and resize grip.
+    for center in [
+        panel_rect.left_top() + egui::vec2(5.0, 5.0),
+        panel_rect.left_bottom() + egui::vec2(5.0, -5.0),
+    ] {
+        painter.circle_filled(
+            center + egui::vec2(0.0, 0.5),
+            3.0,
+            Color32::from_rgb(24, 21, 18),
+        );
+        painter.circle_filled(center, 2.2, Color32::from_rgb(135, 125, 106));
+        painter.line_segment(
+            [
+                center + egui::vec2(-1.3, 0.7),
+                center + egui::vec2(1.3, -0.7),
+            ],
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 40, 34)),
+        );
+    }
     let avail_h = ui.available_height();
     let full_w = ui.available_width();
 
@@ -751,6 +830,42 @@ fn draw_minimize_button(ui: &mut egui::Ui, rect: egui::Rect, id: &str) -> bool {
         ),
     );
     resp.clicked()
+}
+
+/// Decode an embedded PNG and upload it as a texture, cached by `name`.
+///
+/// Dimensions come from the file itself. The previous pipeline embedded
+/// headerless `.rgba` dumps and hardcoded the size at every call site, where
+/// the only validation was `from_rgba_unmultiplied`'s `w * h * 4 == len`
+/// assert. That assert is blind to any mistake preserving the total byte count
+/// -- swapping width and height, or reflowing a filmstrip into a grid -- so a
+/// wrong asset rendered as a scrambled panel rather than failing loudly.
+///
+/// `options` is explicit because it is not one-size-fits-all: sprite sheets
+/// need NEAREST, so sampling near a cell edge cannot bleed in the neighbouring
+/// frame, while continuous artwork wants LINEAR.
+fn hardware_texture(
+    ui: &egui::Ui,
+    name: &'static str,
+    png_bytes: &'static [u8],
+    options: egui::TextureOptions,
+) -> egui::TextureHandle {
+    let id = egui::Id::new(name);
+    if let Some(handle) = ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::TextureHandle>(id))
+    {
+        return handle;
+    }
+    let decoded = image::load_from_memory(png_bytes)
+        .unwrap_or_else(|err| panic!("{name}: embedded PNG failed to decode: {err}"))
+        .to_rgba8();
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+    let handle = ui.ctx().load_texture(name, color_image, options);
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id, handle.clone()));
+    handle
 }
 
 fn draw_logo_mark(ui: &egui::Ui, painter: &egui::Painter, badge_rect: egui::Rect) {
@@ -1173,21 +1288,35 @@ fn draw_playback_gain(
     }
     let painter = ui.painter();
     if show_label {
+        // Sit the legend clear of the knob's rim. Deriving this from the radius
+        // keeps it correct if the knob is resized; a fixed offset silently
+        // overlapped the artwork when the knob grew.
         painter.text(
-            egui::pos2(center.x, center.y - 20.0),
-            egui::Align2::CENTER_TOP,
+            egui::pos2(center.x, center.y - GAIN_KNOB_RADIUS - 2.0),
+            egui::Align2::CENTER_BOTTOM,
             "GAIN",
             theme::font_tiny(),
             theme::MUTED,
         );
     }
-    painter.circle_filled(center, 10.0, theme::TRACK_FILL);
-    painter.circle_stroke(center, 10.0, egui::Stroke::new(1.0_f32, theme::STROKE));
-    let angle = std::f32::consts::PI
-        * (0.75
-            + (gain - PLAYBACK_GAIN_MIN_DB) / (PLAYBACK_GAIN_MAX_DB - PLAYBACK_GAIN_MIN_DB) * 1.5);
-    let tip = center + egui::vec2(angle.cos(), angle.sin()) * 7.0;
-    painter.line_segment([center, tip], egui::Stroke::new(2.0_f32, theme::ACCENT));
+    // Teragon ships this knob as a vertical filmstrip: KNOB_FRAMES frames of
+    // 68x68 stacked top to bottom. Using it directly keeps the full 68 px
+    // artwork; the previous build reflowed it into a 15x9 grid at half scale,
+    // throwing away three quarters of the pixels before upload.
+    let knob = hardware_texture(
+        ui,
+        "teragon_knob",
+        include_bytes!("../../../assets/teragon/small_knob_135frames.png"),
+        // NEAREST: a filmstrip cell must never sample into its neighbour.
+        egui::TextureOptions::NEAREST,
+    );
+    let norm = ((gain - PLAYBACK_GAIN_MIN_DB) / (PLAYBACK_GAIN_MAX_DB - PLAYBACK_GAIN_MIN_DB))
+        .clamp(0.0, 1.0);
+    let frame = (norm * (KNOB_FRAMES - 1) as f32).round() as usize;
+    let frame_h = 1.0 / KNOB_FRAMES as f32;
+    let y = frame as f32 * frame_h;
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, y), egui::pos2(1.0, y + frame_h));
+    painter.image(knob.id(), rect, uv, Color32::WHITE);
     response.on_hover_text(format!(
         "Playback gain: {gain:.1} dB\nDrag up/down; double-click to reset"
     ));
@@ -1249,20 +1378,19 @@ fn draw_buffer_slider_in_rect(
     );
     painter.rect_filled(active_rect, egui::CornerRadius::same(2), theme::ACCENT);
 
-    let handle_center = egui::pos2(handle_x, cy);
-    let handle_col = if resp.hovered() || resp.dragged() {
-        theme::ACCENT_HOVER
-    } else {
-        theme::ACCENT
-    };
+    let fader = hardware_texture(
+        ui,
+        "teragon_fader",
+        include_bytes!("../../../assets/teragon/fader.png"),
+        egui::TextureOptions::LINEAR,
+    );
     let handle_rect =
-        egui::Rect::from_center_size(handle_center, egui::vec2(handle_r * 2.0, handle_r * 2.0));
-    painter.rect_filled(handle_rect, egui::CornerRadius::same(0), handle_col);
-    painter.rect_stroke(
+        egui::Rect::from_center_size(egui::pos2(handle_x, cy), egui::vec2(14.0, 16.0));
+    painter.image(
+        fader.id(),
         handle_rect,
-        egui::CornerRadius::same(0),
-        egui::Stroke::new(1.0_f32, theme::BG),
-        egui::StrokeKind::Inside,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
     );
 
     changed
@@ -1447,53 +1575,42 @@ fn draw_transport_button_in_rect(
     }
 
     let painter = ui.painter();
-    if engaged {
-        let fill = if resp.hovered() {
-            theme::ACCENT_HOVER
-        } else {
-            theme::ACCENT
-        };
-        painter.rect_filled(rect, egui::CornerRadius::same(theme::CONTROL_RADIUS), fill);
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            theme::font_small(),
-            theme::BG,
-        );
+    let pressed = enabled && (engaged || resp.is_pointer_button_down_on());
+    let (name, pixels): (&'static str, &'static [u8]) = if pressed {
+        (
+            "teragon_button_pressed",
+            include_bytes!("../../../assets/teragon/push_button_pressed.png"),
+        )
     } else {
-        let fill = if !enabled || resp.hovered() {
-            theme::HOVER_FILL
+        (
+            "teragon_button_normal",
+            include_bytes!("../../../assets/teragon/push_button_normal.png"),
+        )
+    };
+    let button = hardware_texture(ui, name, pixels, egui::TextureOptions::LINEAR);
+    painter.image(
+        button.id(),
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        if enabled {
+            Color32::WHITE
         } else {
-            theme::PANEL
-        };
-        let stroke_col = if !enabled {
-            theme::DISABLED_STROKE
-        } else if resp.hovered() {
-            theme::ACCENT_HOVER
-        } else {
-            theme::STROKE
-        };
-        let text_col = if !enabled {
-            theme::DISABLED_TEXT
-        } else {
+            Color32::GRAY
+        },
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        theme::font_small(),
+        if pressed {
+            theme::BG
+        } else if enabled {
             theme::TEXT
-        };
-        painter.rect_filled(rect, egui::CornerRadius::same(theme::CONTROL_RADIUS), fill);
-        painter.rect_stroke(
-            rect,
-            egui::CornerRadius::same(theme::CONTROL_RADIUS),
-            egui::Stroke::new(1.0_f32, stroke_col),
-            egui::StrokeKind::Inside,
-        );
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            theme::font_small(),
-            text_col,
-        );
-    }
+        } else {
+            theme::DISABLED_TEXT
+        },
+    );
 
     enabled && resp.clicked()
 }

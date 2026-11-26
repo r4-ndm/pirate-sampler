@@ -25,6 +25,7 @@ parking_lot.workspace = true
 rfd.workspace = true
 atomic_float.workspace = true
 hound.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Frameless window chrome (undecorate / minimize / drag-to-move) for the
 # standalone build. Already in the dependency graph via baseview.

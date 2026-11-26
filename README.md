@@ -1,5 +1,9 @@
 # Pirate Sampler
 
+The tinted metal texture is adapted from [Audio knobs, button, sliders etc.](https://opengameart.org/content/audio-knobs-button-sliders-etc) by Osmic, licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
+
+Knob, pushbutton and fader graphics are from [TeragonGuiComponents](https://github.com/teragonaudio/TeragonGuiComponents) by Max Rudberg and Teragon Audio, under [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/). The knob filmstrip and pushbuttons are used unmodified; the slider thumb is rotated 90° to suit a horizontal fader. Any adapted artwork is likewise licensed under CC BY-SA 3.0.
+
 Linux-first **standalone** rolling ring-buffer sampler, written in Rust.
 
 ![Pirate Sampler standalone window](assets/pirate-sampler.png)

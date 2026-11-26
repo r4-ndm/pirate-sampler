@@ -10,3 +10,6 @@ target/
 .backup-*/
 tmux-*.log
 vendor/nih-plug/.git/
+
+# Headerless raw dumps, superseded by the PNG loader in hardware_texture().
+*.rgba

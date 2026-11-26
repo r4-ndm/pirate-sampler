@@ -37,10 +37,16 @@ pub fn draw_waveform_card(
     );
     let painter = ui.painter_at(plot_rect);
 
-    let mid = plot_rect.center().y;
-    let half_h = (plot_rect.height() * 0.5 - 2.0).max(6.0);
+    painter.rect_filled(
+        plot_rect,
+        egui::CornerRadius::ZERO,
+        Color32::from_rgb(19, 17, 12),
+    );
+    draw_bezel(ui, &painter, plot_rect);
 
-    let num_buckets = (plot_rect.width().max(32.0) as usize).clamp(32, 2048);
+    let mid = plot_rect.center().y;
+
+    let num_buckets = ((plot_rect.width() / 7.0) as usize).clamp(1, 512);
     let (view_start, view_end) = ed.view_range;
     let visible_start = view_start.max(0.0);
     let visible_end = view_end.min(1.0);
@@ -49,15 +55,22 @@ pub fn draw_waveform_card(
     let (peaks, playhead) =
         waveform_snapshot(ed, num_buckets, visible_buckets, visible_start, visible_end);
 
-    draw_peaks(
-        &painter,
-        plot_rect,
-        ed.view_range,
-        &peaks,
-        is_empty,
-        mid,
-        half_h,
-    );
+    let glass_painter = painter.with_clip_rect(plot_rect.shrink(13.0));
+    draw_peaks(&glass_painter, plot_rect, ed.view_range, &peaks, is_empty);
+    // A low-opacity reflection sits over the LEDs, not over selection handles.
+    let glass = plot_rect.shrink(13.0);
+    if glass.is_positive() {
+        glass_painter.add(egui::Shape::convex_polygon(
+            vec![
+                glass.left_top(),
+                glass.right_top(),
+                egui::pos2(glass.right(), glass.top() + glass.height() * 0.16),
+                egui::pos2(glass.left(), glass.top() + glass.height() * 0.32),
+            ],
+            Color32::from_rgba_unmultiplied(255, 235, 195, 8),
+            egui::Stroke::NONE,
+        ));
+    }
 
     let hovering_edge = handle_pointer_interaction(ui, &response, plot_rect, ed);
 
@@ -72,14 +85,75 @@ pub fn draw_waveform_card(
     }
 }
 
+/// Scale the bezel's edges independently so its corners retain their proportions.
+fn draw_bezel(ui: &egui::Ui, painter: &egui::Painter, rect: egui::Rect) {
+    let id = egui::Id::new("waveform_bezel_texture");
+    let texture = match ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::TextureHandle>(id))
+    {
+        Some(texture) => texture,
+        None => {
+            // Size comes from the PNG header rather than being hardcoded here,
+            // so re-exporting the bezel at another resolution needs no code change.
+            let decoded = image::load_from_memory(include_bytes!(
+                "../../../assets/waveform-bezel.png"
+            ))
+            .expect("waveform-bezel.png failed to decode")
+            .to_rgba8();
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [decoded.width() as usize, decoded.height() as usize],
+                decoded.as_raw(),
+            );
+            let texture =
+                ui.ctx()
+                    .load_texture("waveform_bezel", image, egui::TextureOptions::LINEAR);
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        }
+    };
+    let edge = 13.0_f32.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    let xs = [
+        rect.left(),
+        rect.left() + edge,
+        rect.right() - edge,
+        rect.right(),
+    ];
+    let ys = [
+        rect.top(),
+        rect.top() + edge,
+        rect.bottom() - edge,
+        rect.bottom(),
+    ];
+    let uv = [0.0, 32.0 / 192.0, 160.0 / 192.0, 1.0];
+    for row in 0..3 {
+        for col in 0..3 {
+            if row == 1 && col == 1 {
+                continue;
+            }
+            painter.image(
+                texture.id(),
+                egui::Rect::from_min_max(
+                    egui::pos2(xs[col], ys[row]),
+                    egui::pos2(xs[col + 1], ys[row + 1]),
+                ),
+                egui::Rect::from_min_max(
+                    egui::pos2(uv[col], uv[row]),
+                    egui::pos2(uv[col + 1], uv[row + 1]),
+                ),
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
 fn draw_peaks(
     painter: &egui::Painter,
     plot_rect: egui::Rect,
     view_range: (f32, f32),
     peaks: &[(f32, f32)],
     is_empty: bool,
-    mid: f32,
-    half_h: f32,
 ) {
     let visible_start = view_range.0.max(0.0);
     let visible_end = view_range.1.min(1.0);
@@ -95,56 +169,44 @@ fn draw_peaks(
     } else {
         let n = peaks.len() as f32;
         let max_peak = peaks.iter().fold(0.0_f32, |acc, &(l, r)| acc.max(l.max(r)));
-        let outer_fill = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 89);
-        let mid_fill = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 153);
-        let core_fill = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 217);
-        let contour_stroke = egui::Stroke::new(1.0_f32, theme::TEXT);
-
-        let mut prev_top: Option<egui::Pos2> = None;
-        let mut prev_bot: Option<egui::Pos2> = None;
-
+        // Each time bucket is a bottom-up column of horizontal LED segments.
+        let pitch = 6.0;
+        let height = (plot_rect.height() - 28.0).max(0.0);
+        let segment_width = (plot_rect.width()
+            / num_columns_for_view(peaks.len(), visible_start, visible_end, view_range))
+        .min(5.0);
         for (i, (l, r)) in peaks.iter().enumerate() {
             let t = visible_start + (i as f32 + 0.5) / n * (visible_end - visible_start);
             let x = x_at_t(t, plot_rect, view_range);
-            let raw_amp = ((*l).max(*r)).clamp(0.0, 1.0);
-            let norm_amp = if max_peak > 1e-6 {
-                (raw_amp / max_peak).clamp(0.0, 1.0)
+            let raw_amp = l.max(*r).clamp(0.0, 1.0);
+            let amplitude = if max_peak > 1e-6 {
+                raw_amp / max_peak
             } else {
                 0.0
             };
-            let bar_h = if norm_amp > 0.001 {
-                (norm_amp * half_h).max(1.5)
-            } else {
-                1.0
-            };
-            let y0 = mid - bar_h;
-            let y1 = mid + bar_h;
-
-            painter.line_segment(
-                [egui::pos2(x, y0), egui::pos2(x, y1)],
-                egui::Stroke::new(1.25_f32, outer_fill),
-            );
-            let mid_h = (bar_h * 0.68).max(0.8);
-            painter.line_segment(
-                [egui::pos2(x, mid - mid_h), egui::pos2(x, mid + mid_h)],
-                egui::Stroke::new(1.25_f32, mid_fill),
-            );
-            let core_h = (bar_h * 0.36).max(0.6);
-            painter.line_segment(
-                [egui::pos2(x, mid - core_h), egui::pos2(x, mid + core_h)],
-                egui::Stroke::new(1.25_f32, core_fill),
-            );
-
-            let top_pt = egui::pos2(x, y0);
-            let bot_pt = egui::pos2(x, y1);
-            if let (Some(pt), Some(pb)) = (prev_top, prev_bot) {
-                painter.line_segment([pt, top_pt], contour_stroke);
-                painter.line_segment([pb, bot_pt], contour_stroke);
+            let rows = (amplitude * height / pitch).floor() as i32;
+            for row in 0..=rows {
+                let y = plot_rect.bottom() - 14.0 - row as f32 * pitch;
+                let color = if row as f32 * pitch > height * 0.8 {
+                    theme::DANGER
+                } else {
+                    theme::ACCENT
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(x - segment_width * 0.5, y),
+                        egui::pos2(x + segment_width * 0.5, y),
+                    ],
+                    egui::Stroke::new(2.0_f32, color),
+                );
             }
-            prev_top = Some(top_pt);
-            prev_bot = Some(bot_pt);
         }
     }
+}
+
+fn num_columns_for_view(count: usize, start: f32, end: f32, view: (f32, f32)) -> f32 {
+    let fraction = ((end - start) / (view.1 - view.0)).max(f32::EPSILON);
+    (count as f32 / fraction).max(1.0)
 }
 
 /// One locked snapshot of the peaks and playhead for this frame.
@@ -457,7 +519,7 @@ fn draw_selection_overlay(
     painter.rect_filled(
         sel_rect,
         egui::CornerRadius::ZERO,
-        Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 40),
+        Color32::from_rgba_unmultiplied(0xDB, 0x9D, 0x44, 40),
     );
     painter.rect_stroke(
         sel_rect,
